@@ -1,4 +1,4 @@
-# Korean Stock Remote MCP Server
+# Naver Stock MCP Server
 
 네이버 증권 API 기반 한국 주식 데이터 MCP 서버를 **claude.ai 커스텀 커넥터**로 쓸 수
 있도록 만든 **원격(HTTP) 버전**입니다. 원본(`agent504330-ux/mcp-korean-stock`)은

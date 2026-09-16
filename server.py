@@ -10,11 +10,13 @@
 - 인증 없음(authless), 읽기 전용(GET 요청만). 외부로 데이터를 보내지 않습니다.
 
 도구:
-  - stock_price   : 종목 현재가
-  - stock_detail  : 상세 정보 (시가/고가/저가/거래량/시총/PER/PBR 등)
-  - stock_search  : 종목명으로 종목코드 검색
-  - market_index  : KOSPI/KOSDAQ 지수
-  - stock_news    : 종목 관련 최신 뉴스
+  - stock_price          : 종목 현재가
+  - stock_detail         : 상세 정보 (시가/고가/저가/거래량/시총/PER/PBR/컨센서스 등)
+  - stock_search         : 종목명으로 종목코드 검색
+  - market_index         : KOSPI/KOSDAQ 지수
+  - stock_news           : 종목 관련 최신 뉴스
+  - stock_investor_trend : 일별 투자자 수급 (외국인/기관/개인 순매수)
+  - stock_financials     : 실적 추이 (분기/연간, 컨센서스 추정 포함)
 """
 
 import json
@@ -45,6 +47,16 @@ def _fetch(url: str):
             return json.loads(resp.read().decode())
     except Exception as e:  # noqa: BLE001 - 어떤 실패든 호출자에게 메시지로 전달
         return {"error": str(e)}
+
+
+def _to_int(text):
+    """'-1,088,039' / '+1,379,866' 형태의 문자열을 정수로. 변환 불가면 None."""
+    if not isinstance(text, str):
+        return None
+    try:
+        return int(text.replace(",", "").replace("+", "").strip())
+    except ValueError:
+        return None
 
 
 @mcp.tool()
@@ -83,11 +95,25 @@ def stock_detail(code: str) -> str:
     field_order = [
         "전일", "시가", "고가", "저가", "거래량", "대금",
         "시총", "외인소진율", "52주 최고", "52주 최저",
-        "PER", "EPS", "PBR", "BPS", "배당수익률",
+        "PER", "EPS", "추정PER", "추정EPS", "PBR", "BPS",
+        "배당수익률", "주당배당금",
     ]
     for key in field_order:
         if key in infos:
             lines.append(f"{key}: {infos[key]}")
+
+    # 컨센서스는 애널리스트 커버리지가 있는 종목만 제공된다(소형주는 null).
+    consensus = data.get("consensusInfo")
+    if consensus:
+        target = consensus.get("priceTargetMean")
+        recomm = consensus.get("recommMean")
+        created = consensus.get("createDate", "")
+        lines.append("")
+        lines.append(f"[컨센서스 {created} 기준]")
+        if target:
+            lines.append(f"목표주가 평균: {target}원")
+        if recomm:
+            lines.append(f"투자의견 평균: {recomm}")
 
     return "\n".join(lines)
 
@@ -169,6 +195,109 @@ def stock_news(code: str) -> str:
             lines.append(f"  - {title} ({source}, {date})")
 
     return "\n".join(lines) if len(lines) > 2 else f"종목 {code} 뉴스 파싱 실패"
+
+
+@mcp.tool()
+def stock_investor_trend(code: str, days: int = 10) -> str:
+    """종목의 일별 투자자 수급(외국인/기관/개인 순매수 수량)을 조회합니다. days는 조회할 거래일 수(기본 10, 최대 60)."""
+    days = max(1, min(days, 60))
+    data = _fetch(f"{NAVER_STOCK_API}/stock/{code}/trend?pageSize={days}")
+    if not data or (isinstance(data, dict) and "error" in data):
+        return f"종목코드 {code} 수급 조회 실패"
+    if not isinstance(data, list) or not data:
+        return f"종목 {code} 수급 데이터가 없습니다"
+
+    lines = [
+        f"종목 {code} 투자자 수급 — 최근 {len(data)}거래일",
+        "단위: 주 (+순매수 / -순매도)",
+        "",
+    ]
+    totals = {"foreignerPureBuyQuant": 0, "organPureBuyQuant": 0, "individualPureBuyQuant": 0}
+    labels = (
+        ("foreignerPureBuyQuant", "외국인"),
+        ("organPureBuyQuant", "기관"),
+        ("individualPureBuyQuant", "개인"),
+    )
+    for item in data:
+        date = item.get("bizdate", "")
+        date = f"{date[:4]}-{date[4:6]}-{date[6:8]}" if len(date) == 8 else date
+        # 한글/숫자 혼합 표는 폭이 어긋나 열을 오독할 수 있어 레이블 방식으로 출력한다.
+        parts = [f"{date}  종가 {item.get('closePrice', '-')}"]
+        for key, label in labels:
+            raw = item.get(key, "-")
+            parts.append(f"{label} {raw}")
+            value = _to_int(raw)
+            if value is not None:
+                totals[key] += value
+        lines.append(" | ".join(parts))
+
+    lines.append("")
+    lines.append(
+        f"기간 합계 — 외국인: {totals['foreignerPureBuyQuant']:+,} / "
+        f"기관: {totals['organPureBuyQuant']:+,} / "
+        f"개인: {totals['individualPureBuyQuant']:+,}"
+    )
+    hold_ratio = data[0].get("foreignerHoldRatio")
+    if hold_ratio:
+        lines.append(f"외국인 보유율: {hold_ratio} ({data[0].get('bizdate', '')} 기준)")
+
+    return "\n".join(lines)
+
+
+# 네이버 응답에는 단위 메타가 없어 지표별 단위를 여기서 명시한다.
+# (검증: 삼성전자 2026.03 매출액 1,338,734 = 133.9조 → 억원)
+_FINANCE_UNITS = {
+    "매출액": "억원", "영업이익": "억원", "당기순이익": "억원",
+    "지배주주순이익": "억원", "비지배주주순이익": "억원",
+    "영업이익률": "%", "순이익률": "%", "ROE": "%",
+    "부채비율": "%", "당좌비율": "%", "유보율": "%",
+    "EPS": "원", "BPS": "원", "주당배당금": "원",
+    "PER": "배", "PBR": "배",
+}
+
+
+@mcp.tool()
+def stock_financials(code: str, period: str = "quarter") -> str:
+    """종목의 실적 추이를 조회합니다 (매출액/영업이익/순이익/이익률/ROE/EPS 등). period는 quarter(분기) 또는 annual(연간). 기간 뒤 (E)는 컨센서스 추정치입니다."""
+    period_map = {
+        "QUARTER": "quarter", "분기": "quarter", "Q": "quarter",
+        "ANNUAL": "annual", "연간": "annual", "YEAR": "annual", "A": "annual",
+    }
+    period_code = period_map.get(period.upper(), period.lower())
+    if period_code not in ("quarter", "annual"):
+        return f"period는 quarter 또는 annual이어야 합니다 (입력: {period})"
+
+    data = _fetch(f"{NAVER_STOCK_API}/stock/{code}/finance/{period_code}")
+    if not data or "error" in data:
+        return f"종목코드 {code} 실적 조회 실패"
+
+    finance = data.get("financeInfo") or {}
+    titles = finance.get("trTitleList") or []
+    rows = finance.get("rowList") or []
+    if not titles or not rows:
+        return f"종목 {code} 실적 데이터가 없습니다"
+
+    label = "분기" if period_code == "quarter" else "연간"
+    headers = [f"{t.get('title', '')}{'(E)' if t.get('isConsensus') == 'Y' else ''}" for t in titles]
+    keys = [t.get("key") for t in titles]
+
+    lines = [
+        f"종목 {code} 실적 추이 ({label})",
+        "(E) = 컨센서스 추정치, '-' = 데이터 없음",
+        "",
+        "기간: " + " | ".join(headers),
+        "",
+    ]
+    for row in rows:
+        title = row.get("title", "")
+        columns = row.get("columns") or {}
+        # columns는 키 순서가 뒤섞여 있으므로 반드시 trTitleList 순서로 읽는다.
+        values = [str((columns.get(k) or {}).get("value", "-")) for k in keys]
+        unit = _FINANCE_UNITS.get(title)
+        suffix = f" ({unit})" if unit else ""
+        lines.append(f"{title}{suffix}: " + " | ".join(values))
+
+    return "\n".join(lines)
 
 
 # 호스팅 플랫폼의 헬스체크용 엔드포인트. MCP 자체는 /mcp 에서 동작합니다.

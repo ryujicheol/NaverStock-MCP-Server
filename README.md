@@ -10,10 +10,12 @@
 | 도구 | 설명 |
 | --- | --- |
 | `stock_price` | 종목 현재가 |
-| `stock_detail` | 상세 정보 (시가/고가/저가/거래량/시총/PER/PBR/배당수익률 등) |
+| `stock_detail` | 상세 정보 (시가/고가/저가/거래량/시총/PER/PBR/추정PER/추정EPS/배당수익률/컨센서스 등) |
 | `stock_search` | 종목명으로 종목코드 검색 |
 | `market_index` | KOSPI/KOSDAQ 지수 |
 | `stock_news` | 종목 관련 최신 뉴스 |
+| `stock_investor_trend` | 일별 투자자 수급 (외국인/기관/개인 순매수, 기본 10거래일) |
+| `stock_financials` | 실적 추이 (분기/연간, 컨센서스 추정 포함) |
 
 데이터 출처: 네이버 증권 모바일 API. **개인 용도로만 사용하세요.**
 

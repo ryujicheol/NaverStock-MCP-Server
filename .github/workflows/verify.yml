@@ -1,0 +1,31 @@
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # 주 1회: 우리가 아무것도 바꾸지 않아도 네이버 응답이 바뀌면 알아채야 한다.
+  schedule:
+    - cron: "0 0 * * 1"
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # verify.py 는 mcp/starlette 를 스텁으로 갈아끼우므로 설치 없이 돈다.
+      - name: Verify tools against the live API
+        run: python verify.py
+
+      # 스텁으로는 진짜 패키지에서만 나는 오류를 못 잡는다. mcp 2.x 가 FastMCP 를
+      # 개명해 배포가 죽은 적이 있어, 실제 의존성으로 import 되는지까지 확인한다.
+      - name: Install real dependencies
+        run: pip install -r requirements.txt
+
+      - name: Import server with the real packages
+        run: python -c "import server; print('import ok')"

@@ -52,6 +52,14 @@ def _fetch(url: str):
         return {"error": str(e)}
 
 
+def _fmt_datetime(raw):
+    """'202609221911' -> '2026-09-22 19:11'. 형식이 다르면 원본을 그대로 둔다."""
+    text = str(raw or "").strip()
+    if text.isdigit() and len(text) in (12, 14):
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]} {text[8:10]}:{text[10:12]}"
+    return text
+
+
 def _to_int(text):
     """'-1,088,039' / '+1,379,866' 형태의 문자열을 정수로. 변환 불가면 None."""
     if not isinstance(text, str):
@@ -194,7 +202,7 @@ def stock_news(code: str) -> str:
         if isinstance(item, dict):
             title = item.get("title", item.get("tit", ""))
             source = item.get("officeName", item.get("office", ""))
-            date = item.get("datetime", item.get("dt", ""))
+            date = _fmt_datetime(item.get("datetime", item.get("dt", "")))
             lines.append(f"  - {title} ({source}, {date})")
 
     return "\n".join(lines) if len(lines) > 2 else f"종목 {code} 뉴스 파싱 실패"

@@ -17,12 +17,15 @@
   - stock_news           : 종목 관련 최신 뉴스
   - stock_investor_trend : 일별 투자자 수급 (외국인/기관/개인 순매수)
   - stock_financials     : 실적 추이 (분기/연간, 컨센서스 추정 포함)
+  - stock_compare        : 여러 종목 밸류에이션·수익성 비교 (스크리닝용, 최대 50종목)
 """
 
 import json
 import os
+import re
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
@@ -299,6 +302,167 @@ def stock_financials(code: str, period: str = "quarter") -> str:
 
     return "\n".join(lines)
 
+
+# ── 멀티 종목 비교 ────────────────────────────────────────────────
+# 종목당 1회씩 부르면 호출 수가 종목 수만큼 늘고 컨텍스트도 그만큼 먹는다.
+# 스크리닝은 표 하나로 끝나야 하므로 basic/integration/finance를 묶어 병렬로 받는다.
+_COMPARE_MAX = 50
+
+
+def _strip_unit(text):
+    """'12.29배' / '46.56%' → '12.29' / '46.56'. 값이 없으면 '-'."""
+    if not isinstance(text, str):
+        return "-"
+    cleaned = text.replace("배", "").replace("%", "").replace("원", "").strip()
+    return cleaned if cleaned and cleaned != "N/A" else "-"
+
+
+def _short_cap(text):
+    """'1,601조 8,803억' → '1,601조', '5조 6,930억' → '5.7조'."""
+    if not isinstance(text, str):
+        return "-"
+    jo = re.search(r"([\d,]+)\s*조", text)
+    eok = re.search(r"([\d,]+)\s*억", text)
+    jo_val = float(jo.group(1).replace(",", "")) if jo else 0.0
+    eok_val = float(eok.group(1).replace(",", "")) if eok else 0.0
+    if jo_val:
+        total = jo_val + eok_val / 10000
+        return f"{total:,.1f}조" if total < 100 else f"{total:,.0f}조"
+    if eok_val:
+        return f"{eok_val:,.0f}억"
+    return text.strip() or "-"
+
+
+def _annual_frame(finance):
+    """finance/annual에서 (최근 확정 열, 추정 열, 열 목록, 행 맵)을 뽑는다."""
+    info = (finance or {}).get("financeInfo") or {}
+    titles = info.get("trTitleList") or []
+    if not titles:
+        return None, None, [], {}
+    rows = {r.get("title"): (r.get("columns") or {}) for r in (info.get("rowList") or [])}
+    est = [n for n, t in enumerate(titles) if t.get("isConsensus") == "Y"]
+    est_idx = est[0] if est else None
+    fixed_idx = (est[0] - 1) if est else len(titles) - 1
+    return (fixed_idx if fixed_idx is not None and fixed_idx >= 0 else None), est_idx, titles, rows
+
+
+def _frame_cell(rows, titles, idx, name):
+    if idx is None or name not in rows:
+        return "-"
+    value = (rows[name].get(titles[idx].get("key")) or {}).get("value")
+    return str(value) if value not in (None, "") else "-"
+
+
+def _compare_one(code):
+    """한 종목의 비교용 지표. 실패해도 행은 남겨 스크리닝에서 누락을 알아채게 한다."""
+    basic = _fetch(f"{NAVER_STOCK_API}/stock/{code}/basic")
+    integration = _fetch(f"{NAVER_STOCK_API}/stock/{code}/integration")
+    finance = _fetch(f"{NAVER_STOCK_API}/stock/{code}/finance/annual")
+
+    if not isinstance(basic, dict) or "error" in basic or not basic.get("stockName"):
+        return {"code": code, "failed": True}
+
+    infos = {i["key"]: i["value"] for i in (integration.get("totalInfos") or [])} \
+        if isinstance(integration, dict) else {}
+    fixed_idx, est_idx, titles, rows = _annual_frame(finance if isinstance(finance, dict) else {})
+
+    # 추정PER은 integration에 없는 종목이 있어 finance 추정 열로 보완한다.
+    # 두 값은 기준 시점이 달라 미세하게 어긋나므로 보완했음을 표시한다.
+    fwd_per = _strip_unit(infos.get("추정PER"))
+    fallback = False
+    if fwd_per == "-":
+        fwd_per = _frame_cell(rows, titles, est_idx, "PER")
+        fallback = fwd_per != "-"
+
+    return {
+        "code": code,
+        "failed": False,
+        "name": basic.get("stockName", code),
+        "price": basic.get("closePrice", "-"),
+        "status": basic.get("marketStatus", ""),
+        "cap": _short_cap(infos.get("시총")),
+        "per": _strip_unit(infos.get("PER")),
+        "fwd_per": fwd_per,
+        "fallback": fallback,
+        "pbr": _strip_unit(infos.get("PBR")),
+        "opm_fixed": _frame_cell(rows, titles, fixed_idx, "영업이익률"),
+        "opm_est": _frame_cell(rows, titles, est_idx, "영업이익률"),
+        "roe": _frame_cell(rows, titles, est_idx, "ROE"),
+        "fixed_label": titles[fixed_idx].get("title", "") if fixed_idx is not None else "",
+        "est_label": titles[est_idx].get("title", "") if est_idx is not None else "",
+    }
+
+
+@mcp.tool()
+def stock_compare(codes: str) -> str:
+    """여러 종목의 밸류에이션·수익성을 한 표로 비교합니다 (스크리닝용).
+
+    종목마다 stock_detail/stock_financials를 따로 부르는 대신 한 번에 받아옵니다.
+    codes: 종목코드를 콤마로 구분 (예: "005930,000660,058470"). 최대 50개.
+    반환 항목: 현재가·시총·PER·선행PER·PBR·영업이익률(최근 확정/추정)·ROE.
+    """
+    requested = [c.strip() for c in codes.replace("\n", ",").replace(" ", ",").split(",") if c.strip()]
+    if not requested:
+        return '종목코드를 하나 이상 입력하세요 (예: "005930,000660")'
+
+    targets = requested[:_COMPARE_MAX]
+    overflow = len(requested) - len(targets)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(_compare_one, targets))
+
+    lines = [
+        f"종목 비교 — {len(targets)}종목",
+        "",
+        "| 종목 | 현재가 | 시총 | PER | 선행PER | PBR | OPM확정 | OPM추정 | ROE |",
+        "|------|------|------|------|------|------|------|------|------|",
+    ]
+    for r in results:
+        if r["failed"]:
+            lines.append(f"| ({r['code']}) 조회 실패 | - | - | - | - | - | - | - | - |")
+            continue
+        mark = "*" if r["fallback"] else ""
+        lines.append(
+            f"| {r['name']} ({r['code']}) | {r['price']} | {r['cap']} | {r['per']} | "
+            f"{r['fwd_per']}{mark} | {r['pbr']} | {r['opm_fixed']} | {r['opm_est']} | {r['roe']} |"
+        )
+
+    ok = [r for r in results if not r["failed"]]
+    notes = ["단위 — 현재가: 원, PER·PBR: 배, OPM·ROE: %."]
+
+    fixed_labels = {r["fixed_label"] for r in ok if r["fixed_label"]}
+    est_labels = {r["est_label"] for r in ok if r["est_label"]}
+    if len(fixed_labels) == 1 and len(est_labels) == 1:
+        notes.append(
+            f"`OPM확정`은 {fixed_labels.pop()} 확정치, `OPM추정`·`ROE`는 {est_labels.pop()} "
+            "**컨센서스 추정치**입니다. 확정치와 섞어 인용하지 마세요."
+        )
+    else:
+        notes.append(
+            "**결산기가 다른 종목이 섞여 있습니다** — `OPM확정`/`OPM추정`의 기준 연도가 종목마다 다르므로, "
+            "비교 전에 stock_financials로 각 종목의 기준 연도를 확인하세요. "
+            "`OPM추정`·`ROE`는 컨센서스 추정치입니다."
+        )
+
+    if any(r["fallback"] for r in ok):
+        notes.append(
+            "`*` 표시된 선행PER은 종목 상세에 값이 없어 **실적표의 추정 연도 PER로 보완**한 값입니다. "
+            "두 출처는 기준 시점이 달라 소수점 단위로 어긋날 수 있습니다."
+        )
+
+    notes.append(
+        "PER·EPS의 **후행 실적 반영 시점은 종목마다 다릅니다.** 종목 간 PER을 비교하기 전에 "
+        "최근 분기 반영 여부를 확인하세요 — 미반영 종목의 낮은 PER은 이익 개선이 아니라 갱신 지연일 수 있습니다."
+    )
+    if overflow > 0:
+        notes.append(f"입력한 {len(requested)}종목 중 **앞 {_COMPARE_MAX}개만 조회**했습니다(나머지 {overflow}개 생략).")
+
+    closed = [r["name"] for r in ok if r["status"] and r["status"] != "OPEN"]
+    if closed and len(closed) == len(ok):
+        lines.append("")
+        lines.append("※ 장 마감 상태이므로 현재가는 종가입니다.")
+
+    return "\n".join(lines) + "\n\n" + "\n".join(f"> {n}" for n in notes)
 
 # 호스팅 플랫폼의 헬스체크용 엔드포인트. MCP 자체는 /mcp 에서 동작합니다.
 @mcp.custom_route("/", methods=["GET"])

@@ -202,7 +202,8 @@ def check_compare_table():
 
     # 선행PER은 표에 찍힌 현재가 ÷ EPS(E)여야 한다. 실적표의 PER(E)는 배치 시점 값(대개
     # 전일 종가 기준)이라 옮겨 쓰면 틀린다 — 2026-09-23에 `*` 행에서 실제로 났던 버그다.
-    # 적자 추정(EPS(E) ≤ 0)이면 '-'여야 한다. 음수 PER은 "10배 이하" 필터를 통과해 버린다.
+    # 적자면 음수 PER 대신 '적자'여야 한다. 음수 PER은 "10배 이하" 필터를 통과하고,
+    # 크기 순서도 뜻이 없다(적자가 클수록 0에 가깝다).
     col = {label: index for index, label in enumerate(header)}
     checked = stars = losses = off = 0
     for r in rows:
@@ -210,14 +211,14 @@ def check_compare_table():
             continue
         price, eps = server._to_int(r[col["현재가"]]), server._to_int(r[col["EPS(E)"]])
         per = r[col["선행PER"]]
-        if eps is not None and eps <= 0:
+        if eps is not None and eps < 0:
             losses += 1
-            if per.rstrip("*") != "-":
+            if per != "적자":
                 off += 1
                 print(f"    FAIL 선행PER {r[0]}: 적자 추정(EPS(E) {eps:,})인데 {per}")
-                problems.append(f"stock_compare 적자 추정인데 선행PER이 숫자다: {r[0]}")
+                problems.append(f"stock_compare 적자 추정인데 선행PER이 '적자'가 아니다: {r[0]}")
             continue
-        if not price or not eps or per.rstrip("*") == "-":
+        if not price or not eps or per.rstrip("*") in ("-", "적자"):
             continue
         checked += 1
         stars += per.endswith("*")
@@ -227,7 +228,25 @@ def check_compare_table():
             problems.append(f"stock_compare 선행PER이 현재가 ÷ EPS(E)와 다르다: {r[0]}")
     if not off:
         print(f"    ok   선행PER = 현재가 ÷ EPS(E) — {checked}행 검산 일치 (`*` 보완 {stars}행 포함), "
-              f"적자 추정 {losses}행은 '-'")
+              f"적자 추정 {losses}행은 '적자'")
+
+    # 후행 PER도 적자면 '적자'여야 한다. 표에 후행 EPS가 없으니 종목 상세에서 따로 받아 대조한다.
+    trailing_losses = trailing_off = 0
+    for r in rows:
+        if len(r) != len(header) or r[0].endswith("조회 실패"):
+            continue
+        code = r[0].rsplit("(", 1)[-1].rstrip(")")
+        data = fetch(f"https://m.stock.naver.com/api/stock/{code}/integration")
+        infos = {} if "__error__" in data else {i["key"]: i["value"] for i in data.get("totalInfos", [])}
+        eps = server._to_int(server._strip_unit(infos.get("EPS")))
+        is_loss = eps is not None and eps < 0
+        trailing_losses += is_loss
+        if is_loss != (r[col["PER"]] == "적자"):
+            trailing_off += 1
+            print(f"    FAIL 후행 PER {r[0]}: EPS {infos.get('EPS')}인데 {r[col['PER']]}")
+            problems.append(f"stock_compare 후행 PER의 적자 표시가 EPS와 어긋난다: {r[0]}")
+    if not trailing_off:
+        print(f"    ok   후행 PER — 적자 {trailing_losses}행은 '적자'")
 
 
 def check_edges():

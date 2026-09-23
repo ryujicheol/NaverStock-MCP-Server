@@ -362,9 +362,13 @@ def _frame_cell(rows, titles, idx, name):
 
 
 def _fwd_per(price, eps):
-    """현재가 ÷ 추정EPS. 둘 중 하나라도 숫자가 아니거나 EPS가 0이면 '-'."""
+    """현재가 ÷ 추정EPS. 숫자가 아니거나 적자 추정(EPS ≤ 0)이면 '-'.
+
+    음수 PER은 "10배 이하" 같은 필터를 숫자로는 통과해 버린다. 후행 PER도 적자면
+    네이버가 N/A를 주므로 같은 처리다. 적자 추정인지는 EPS(E) 열의 부호로 보인다.
+    """
     price_val, eps_val = _to_int(price), _to_int(eps)
-    if not price_val or not eps_val:
+    if not price_val or eps_val is None or eps_val <= 0:
         return "-"
     return f"{price_val / eps_val:.2f}"
 
@@ -393,6 +397,7 @@ def _compare_one(code):
         fwd_eps = _frame_cell(rows, titles, est_idx, "EPS")
         fallback = fwd_eps != "-"
     price = basic.get("closePrice", "-")
+    fwd_per = _fwd_per(price, fwd_eps)
 
     return {
         "code": code,
@@ -402,9 +407,10 @@ def _compare_one(code):
         "status": basic.get("marketStatus", ""),
         "cap": _short_cap(infos.get("시총")),
         "per": _strip_unit(infos.get("PER")),
-        "fwd_per": _fwd_per(price, fwd_eps),
+        "fwd_per": fwd_per,
         "fwd_eps": fwd_eps,
-        "fallback": fallback,
+        # 적자 추정으로 선행PER이 '-'면 `*`를 달지 않는다("-*"는 뜻이 모호하다).
+        "fallback": fallback and fwd_per != "-",
         "pbr": _strip_unit(infos.get("PBR")),
         "opm_fixed": _frame_cell(rows, titles, fixed_idx, "영업이익률"),
         "opm_est": _frame_cell(rows, titles, est_idx, "영업이익률"),
@@ -420,7 +426,7 @@ def stock_compare(codes: str) -> str:
 
     종목마다 stock_detail/stock_financials를 따로 부르는 대신 한 번에 받아옵니다.
     codes: 종목코드를 콤마로 구분 (예: "005930,000660,058470"). 최대 50개.
-    반환 항목: 현재가·시총·PER·선행PER(현재가 ÷ EPS(E))·EPS(E)·PBR·영업이익률(최근 확정/추정)·ROE(E).
+    반환 항목: 현재가·시총·PER·선행PER(현재가 ÷ EPS(E), 적자 추정이면 '-')·EPS(E)·PBR·영업이익률(최근 확정/추정)·ROE(E).
     """
     requested = [c.strip() for c in codes.replace("\n", ",").replace(" ", ",").split(",") if c.strip()]
     if not requested:
@@ -449,7 +455,10 @@ def stock_compare(codes: str) -> str:
         )
 
     ok = [r for r in results if not r["failed"]]
-    notes = ["단위 — 현재가·EPS(E): 원, PER·PBR: 배, OPM·ROE: %. 선행PER = 현재가 ÷ EPS(E)."]
+    notes = [
+        "단위 — 현재가·EPS(E): 원, PER·PBR: 배, OPM·ROE: %. 선행PER = 현재가 ÷ EPS(E)이며, "
+        "EPS(E)가 0 이하(적자 추정)면 `-`입니다."
+    ]
 
     fixed_labels = {r["fixed_label"] for r in ok if r["fixed_label"]}
     est_labels = {r["est_label"] for r in ok if r["est_label"]}

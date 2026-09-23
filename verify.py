@@ -62,7 +62,7 @@ STOCKS = [
     ("005930", "삼성전자"), ("000660", "SK하이닉스"), ("058470", "리노공업"),
     ("039030", "이오테크닉스"), ("196170", "알테오젠"), ("068270", "셀트리온"),
     ("042660", "한화오션"), ("003490", "대한항공"), ("451800", "한화리츠"),
-    ("900140", "엘브이엠씨홀딩스"),
+    ("900140", "엘브이엠씨홀딩스"), ("011170", "롯데케미칼"),
 ]
 
 # server.py가 각 엔드포인트에서 실제로 꺼내 쓰는 키
@@ -202,13 +202,21 @@ def check_compare_table():
 
     # 선행PER은 표에 찍힌 현재가 ÷ EPS(E)여야 한다. 실적표의 PER(E)는 배치 시점 값(대개
     # 전일 종가 기준)이라 옮겨 쓰면 틀린다 — 2026-09-23에 `*` 행에서 실제로 났던 버그다.
+    # 적자 추정(EPS(E) ≤ 0)이면 '-'여야 한다. 음수 PER은 "10배 이하" 필터를 통과해 버린다.
     col = {label: index for index, label in enumerate(header)}
-    checked = stars = off = 0
+    checked = stars = losses = off = 0
     for r in rows:
         if len(r) != len(header):
             continue
         price, eps = server._to_int(r[col["현재가"]]), server._to_int(r[col["EPS(E)"]])
         per = r[col["선행PER"]]
+        if eps is not None and eps <= 0:
+            losses += 1
+            if per.rstrip("*") != "-":
+                off += 1
+                print(f"    FAIL 선행PER {r[0]}: 적자 추정(EPS(E) {eps:,})인데 {per}")
+                problems.append(f"stock_compare 적자 추정인데 선행PER이 숫자다: {r[0]}")
+            continue
         if not price or not eps or per.rstrip("*") == "-":
             continue
         checked += 1
@@ -218,7 +226,8 @@ def check_compare_table():
             print(f"    FAIL 선행PER {r[0]}: {per} ≠ {price:,} ÷ {eps:,} = {price / eps:.2f}")
             problems.append(f"stock_compare 선행PER이 현재가 ÷ EPS(E)와 다르다: {r[0]}")
     if not off:
-        print(f"    ok   선행PER = 현재가 ÷ EPS(E) — {checked}행 검산 일치 (`*` 보완 {stars}행 포함)")
+        print(f"    ok   선행PER = 현재가 ÷ EPS(E) — {checked}행 검산 일치 (`*` 보완 {stars}행 포함), "
+              f"적자 추정 {losses}행은 '-'")
 
 
 def check_edges():

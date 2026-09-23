@@ -384,6 +384,41 @@ def check_edges():
         print(f"    FAIL 한도 초과분의 코드를 알려주지 않는다: {note[:60]}")
         problems.append("stock_compare 가 생략한 종목코드를 알려주지 않는다")
 
+    # 같은 코드는 한 번만 조회한다(2026-09-23 리뷰: 두 줄로 나오고 한도만 먹었다). 소문자 코드도
+    # 조회돼야 한다 — polling은 소문자 코드를 응답에서 빼서, 옮긴 날 '조회 실패'가 됐었다.
+    # 0126Z0(삼성에피스홀딩스)이 상장폐지되면 다른 영숫자 코드로 바꿀 것.
+    output = server.stock_compare("005930,005930,0126z0")
+    names = [l.split("|")[1].strip() for l in output.split("\n") if l.startswith("|")][2:]
+    dedup = len(names) == 2 and any("한 번만" in l and "005930" in l for l in output.split("\n"))
+    lower = not any("조회 실패" in n for n in names) and "실패" not in server.stock_price("0126z0")
+    print(f"    {'ok  ' if dedup else 'FAIL'} 같은 코드 두 번 → 한 행, 중복 안내 ({len(names)}행)")
+    print(f"    {'ok  ' if lower else 'FAIL'} 소문자 코드(0126z0) → 조회된다")
+    if not dedup:
+        problems.append("stock_compare 가 중복 코드를 걸러내지 않는다")
+    if not lower:
+        problems.append("소문자 종목코드가 조회 실패로 나온다")
+
+    # 우선주는 EPS·BPS가 보통주 값이라 배수가 낮게 나온다 — 행에 †와 주석이 붙어야 한다
+    # (2026-09-23 리뷰). 주석의 전제(보통주 값과 같다)도 함께 본다. 네이버가 우선주 자체 EPS를
+    # 주기 시작하면 주석이 거짓이 된다.
+    output = server.stock_compare("005930,005935")
+    names = [l.split("|")[1].strip() for l in output.split("\n") if l.startswith("|")][2:]
+    marked = [n for n in names if "†" in n]
+    if marked == ["삼성전자우† (005935)"] and "`†` 표시는 **우선주**" in output:
+        print("    ok   우선주 행에만 †와 주석")
+    else:
+        print(f"    FAIL 우선주 표시가 어긋났다: {names}")
+        problems.append("stock_compare 우선주 표시가 어긋났다")
+    common, pref = ({i["code"]: i["value"] for i in fetch(
+        f"https://m.stock.naver.com/api/stock/{code}/integration").get("totalInfos", [])}
+        for code in ("005930", "005935"))
+    differ = [k for k in ("eps", "cnsEps", "bps") if common.get(k) != pref.get(k)]
+    if differ:
+        print(f"    FAIL 삼성전자우의 {differ}가 보통주와 다르다 — † 주석(보통주 값)을 고칠 것")
+        problems.append(f"우선주 EPS·BPS가 더 이상 보통주 값이 아니다: {differ}")
+    else:
+        print("    ok   주석 전제 — 삼성전자우 EPS·추정EPS·BPS = 보통주 값")
+
 
 def main():
     check_referenced_fields()

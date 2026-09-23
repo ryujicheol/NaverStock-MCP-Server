@@ -78,8 +78,9 @@ def _fetch_quotes(codes):
 
     한 응답이라 모든 종목이 같은 시점 가격이고, 시총도 그 가격으로 계산돼 있다.
     없는 코드·상장폐지 코드는 응답에서 조용히 빠지므로 호출자가 누락을 확인해야 한다.
+    소문자 코드(0126z0)도 빠지므로 대문자로 보낸다 — 응답 키도 대문자다. basic API는 소문자도 받았다.
     """
-    joined = urllib.parse.quote(",".join(codes), safe=",")
+    joined = urllib.parse.quote(",".join(c.upper() for c in codes), safe=",")
     data = _fetch(f"{NAVER_POLLING_API}/{joined}")
     if not isinstance(data, dict) or "error" in data:
         return {}, ""
@@ -155,7 +156,7 @@ def stock_price(code: str) -> str:
     정규장이 끝나도 KRX 애프터마켓(16:00~20:00) 동안 현재가가 움직이므로 가격 기준을 함께 표시하고,
     정규장 밖에서는 정규장 종가도 따로 보여줍니다."""
     quotes, fetched_at = _fetch_quotes([code])
-    data = quotes.get(code)
+    data = quotes.get(code.upper())  # 응답 코드는 대문자다(0126z0 → 0126Z0)
     if not data:
         return f"종목코드 {code} 조회 실패"
 
@@ -217,10 +218,11 @@ def stock_detail(code: str) -> str:
     # 이 표의 시세는 기준이 섞여 있다(2026-09-23 삼성전자: 시가 282,500·저가 280,750은 NXT 체결,
     # KRX는 284,500·281,000). 시총·PER·PBR은 조회 시점 가격이라 저녁엔 애프터마켓 가격 기준이다.
     quotes, fetched_at = _fetch_quotes([code])
-    if quotes.get(code):
+    quote = quotes.get(code.upper())
+    if quote:
         lines.append("")
         lines.append(f"[시세 기준 — 조회 {fetched_at}]")
-        lines.append(f"시총·PER·PBR 기준 가격: {_with_caveat(_price_basis(quotes[code]))}")
+        lines.append(f"시총·PER·PBR 기준 가격: {_with_caveat(_price_basis(quote))}")
         lines.append("시가·고가·저가·거래량·대금: KRX+NXT 통합 / 전일: 정규장 종가")
 
     return "\n".join(lines)
@@ -517,11 +519,16 @@ def _compare_one(code, quote):
     price_val, bps = _to_int(price), _to_int(_strip_unit(infos.get("BPS")))
     pbr = f"{price_val / bps:.2f}" if price_val and bps and bps > 0 else _strip_unit(infos.get("PBR"))
     cap_won = _to_int(quote.get("marketValueFull"))
+    name = quote.get("stockName", code)
 
     return {
         "code": code,
         "failed": False,
-        "name": quote.get("stockName", code),
+        "name": name,
+        # 우선주는 네이버가 EPS·추정EPS·BPS를 보통주 값으로 준다(2026-09-23 삼성전자우·현대차2우B 등
+        # 10쌍 모두 일치). 응답에 우선주 표시가 없어 KRX 코드 규칙(보통주는 끝자리 0)과 이름의 '우'로
+        # 가린다 — 이름만 보면 우리금융지주·대우건설 같은 보통주가 걸린다.
+        "preferred": not code.endswith("0") and "우" in name,
         "price": price,
         "basis": _price_basis(quote),
         "cap": _fmt_cap(cap_won),
@@ -545,15 +552,18 @@ def stock_compare(codes: str, sort_by: str = "") -> str:
     """여러 종목의 밸류에이션·수익성을 한 표로 비교합니다 (스크리닝용).
 
     종목마다 stock_detail/stock_financials를 따로 부르는 대신 한 번에 받아옵니다.
-    codes: 종목코드를 콤마로 구분 (예: "005930,000660,058470"). 최대 50개.
+    codes: 종목코드를 콤마로 구분 (예: "005930,000660,058470"). 최대 50개, 같은 코드는 한 번만 조회합니다.
     sort_by: 정렬 기준 열 (선택). 선행PER·PER·PBR은 낮은 순, 시총·ROE(E)·OPM추정·OPM확정은 높은 순이고
         적자·값 없음은 맨 아래로 갑니다. 비우면 입력 순서.
     반환 항목: 현재가·시총·PER·선행PER·EPS(E)·PBR·영업이익률(최근 확정/추정)·ROE(E).
     시총·PER·선행PER·PBR은 모두 표의 현재가로 계산합니다(PER = 현재가 ÷ EPS, 선행PER = 현재가 ÷ EPS(E)).
     표 위에 현재가 기준(정규장 실시간 / 애프터마켓 / 장 마감)과 조회 시각을 표시합니다.
-    PER·선행PER은 적자면 '적자', 값이 없으면 '-'.
+    PER·선행PER은 적자면 '적자', 값이 없으면 '-'. 우선주(†)는 EPS·BPS가 보통주 값이라 배수가 낮게 나옵니다.
     """
-    requested = [c.strip() for c in codes.replace("\n", ",").replace(" ", ",").split(",") if c.strip()]
+    # 응답 코드가 대문자라 입력도 대문자로 맞춘다. 같은 코드는 한 번만 조회한다(두 줄로 나오고 한도만 먹었다).
+    entered = [c.strip().upper() for c in codes.replace("\n", ",").replace(" ", ",").split(",") if c.strip()]
+    requested = list(dict.fromkeys(entered))
+    duplicates = [c for c in requested if entered.count(c) > 1]
     if not requested:
         return '종목코드를 하나 이상 입력하세요 (예: "005930,000660")'
     sort = sort_by.replace(" ", "").upper()
@@ -596,8 +606,9 @@ def stock_compare(codes: str, sort_by: str = "") -> str:
             lines.append(f"| ({r['code']}) 조회 실패 | - | - | - | - | - | - | - | - | - |")
             continue
         mark = "*" if r["fallback"] else ""
+        pref = "†" if r["preferred"] else ""
         lines.append(
-            f"| {r['name']} ({r['code']}) | {r['price']} | {r['cap']} | {r['per']} | "
+            f"| {r['name']}{pref} ({r['code']}) | {r['price']} | {r['cap']} | {r['per']} | "
             f"{r['fwd_per']}{mark} | {r['fwd_eps']} | {r['pbr']} | {r['opm_fixed']} | {r['opm_est']} | {r['roe']} |"
         )
 
@@ -626,10 +637,18 @@ def stock_compare(codes: str, sort_by: str = "") -> str:
             "선행PER은 다른 행과 똑같이 현재가 ÷ EPS(E)입니다."
         )
 
+    if any(r["preferred"] for r in ok):
+        notes.append(
+            "`†` 표시는 **우선주**입니다. EPS·EPS(E)·BPS가 보통주 값이라(네이버도 같은 방식) PER·선행PER·PBR에 "
+            "우선주 할인이 들어가 낮게 나옵니다. 보통주나 다른 종목과 배수를 그대로 비교하지 마세요."
+        )
+
     notes.append(
         "PER·EPS의 **후행 실적 반영 시점은 종목마다 다릅니다.** 종목 간 PER을 비교하기 전에 "
         "최근 분기 반영 여부를 확인하세요 — 미반영 종목의 낮은 PER은 이익 개선이 아니라 갱신 지연일 수 있습니다."
     )
+    if duplicates:
+        notes.append(f"두 번 이상 넣은 {len(duplicates)}종목({', '.join(duplicates)})은 한 번만 조회했습니다.")
     if omitted:
         notes.append(
             f"입력한 {len(requested)}종목 중 **앞 {_COMPARE_MAX}개만 조회**했습니다. "

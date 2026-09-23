@@ -200,6 +200,26 @@ def check_compare_table():
     else:
         print(f"    ok   {len(rows)}행, 깨진 행 없음, 죽은 컬럼 없음")
 
+    # 선행PER은 표에 찍힌 현재가 ÷ EPS(E)여야 한다. 실적표의 PER(E)는 배치 시점 값(대개
+    # 전일 종가 기준)이라 옮겨 쓰면 틀린다 — 2026-09-23에 `*` 행에서 실제로 났던 버그다.
+    col = {label: index for index, label in enumerate(header)}
+    checked = stars = off = 0
+    for r in rows:
+        if len(r) != len(header):
+            continue
+        price, eps = server._to_int(r[col["현재가"]]), server._to_int(r[col["EPS(E)"]])
+        per = r[col["선행PER"]]
+        if not price or not eps or per.rstrip("*") == "-":
+            continue
+        checked += 1
+        stars += per.endswith("*")
+        if abs(float(per.rstrip("*")) - price / eps) > 0.006:
+            off += 1
+            print(f"    FAIL 선행PER {r[0]}: {per} ≠ {price:,} ÷ {eps:,} = {price / eps:.2f}")
+            problems.append(f"stock_compare 선행PER이 현재가 ÷ EPS(E)와 다르다: {r[0]}")
+    if not off:
+        print(f"    ok   선행PER = 현재가 ÷ EPS(E) — {checked}행 검산 일치 (`*` 보완 {stars}행 포함)")
+
 
 def check_edges():
     print("\n" + "=" * 62)

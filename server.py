@@ -361,6 +361,14 @@ def _frame_cell(rows, titles, idx, name):
     return str(value) if value not in (None, "") else "-"
 
 
+def _fwd_per(price, eps):
+    """현재가 ÷ 추정EPS. 둘 중 하나라도 숫자가 아니거나 EPS가 0이면 '-'."""
+    price_val, eps_val = _to_int(price), _to_int(eps)
+    if not price_val or not eps_val:
+        return "-"
+    return f"{price_val / eps_val:.2f}"
+
+
 def _compare_one(code):
     """한 종목의 비교용 지표. 실패해도 행은 남겨 스크리닝에서 누락을 알아채게 한다."""
     basic = _fetch(f"{NAVER_STOCK_API}/stock/{code}/basic")
@@ -374,23 +382,28 @@ def _compare_one(code):
         if isinstance(integration, dict) else {}
     fixed_idx, est_idx, titles, rows = _annual_frame(finance if isinstance(finance, dict) else {})
 
-    # 추정PER은 integration에 없는 종목이 있어 finance 추정 열로 보완한다.
-    # 두 값은 기준 시점이 달라 미세하게 어긋나므로 보완했음을 표시한다.
-    fwd_per = _strip_unit(infos.get("추정PER"))
+    # 선행PER은 표에 찍는 현재가 ÷ 추정EPS로 직접 계산한다. finance 추정 열의 PER은
+    # 현재가가 아닌 배치 시점 값(대개 전일 종가 기준)이라 옮겨 쓰면 틀린다(2026-09-23
+    # 케이씨텍: 12.46, 현재가 기준 13.48). integration 추정PER은 현재가 기준이지만 basic과
+    # 따로 받아 호가가 어긋날 수 있다. 추정EPS는 integration에 없는 종목이 있어 finance
+    # 추정 열로 보완하고 표시한다 — 두 출처가 다 있는 시총 상위 129종목에서 127개 일치, 2개는 1원 차.
+    fwd_eps = _strip_unit(infos.get("추정EPS"))
     fallback = False
-    if fwd_per == "-":
-        fwd_per = _frame_cell(rows, titles, est_idx, "PER")
-        fallback = fwd_per != "-"
+    if fwd_eps == "-":
+        fwd_eps = _frame_cell(rows, titles, est_idx, "EPS")
+        fallback = fwd_eps != "-"
+    price = basic.get("closePrice", "-")
 
     return {
         "code": code,
         "failed": False,
         "name": basic.get("stockName", code),
-        "price": basic.get("closePrice", "-"),
+        "price": price,
         "status": basic.get("marketStatus", ""),
         "cap": _short_cap(infos.get("시총")),
         "per": _strip_unit(infos.get("PER")),
-        "fwd_per": fwd_per,
+        "fwd_per": _fwd_per(price, fwd_eps),
+        "fwd_eps": fwd_eps,
         "fallback": fallback,
         "pbr": _strip_unit(infos.get("PBR")),
         "opm_fixed": _frame_cell(rows, titles, fixed_idx, "영업이익률"),
@@ -407,7 +420,7 @@ def stock_compare(codes: str) -> str:
 
     종목마다 stock_detail/stock_financials를 따로 부르는 대신 한 번에 받아옵니다.
     codes: 종목코드를 콤마로 구분 (예: "005930,000660,058470"). 최대 50개.
-    반환 항목: 현재가·시총·PER·선행PER·PBR·영업이익률(최근 확정/추정)·ROE.
+    반환 항목: 현재가·시총·PER·선행PER(현재가 ÷ EPS(E))·EPS(E)·PBR·영업이익률(최근 확정/추정)·ROE(E).
     """
     requested = [c.strip() for c in codes.replace("\n", ",").replace(" ", ",").split(",") if c.strip()]
     if not requested:
@@ -422,40 +435,40 @@ def stock_compare(codes: str) -> str:
     lines = [
         f"종목 비교 — {len(targets)}종목",
         "",
-        "| 종목 | 현재가 | 시총 | PER | 선행PER | PBR | OPM확정 | OPM추정 | ROE |",
-        "|------|------|------|------|------|------|------|------|------|",
+        "| 종목 | 현재가 | 시총 | PER | 선행PER | EPS(E) | PBR | OPM확정 | OPM추정 | ROE(E) |",
+        "|------|------|------|------|------|------|------|------|------|------|",
     ]
     for r in results:
         if r["failed"]:
-            lines.append(f"| ({r['code']}) 조회 실패 | - | - | - | - | - | - | - | - |")
+            lines.append(f"| ({r['code']}) 조회 실패 | - | - | - | - | - | - | - | - | - |")
             continue
         mark = "*" if r["fallback"] else ""
         lines.append(
             f"| {r['name']} ({r['code']}) | {r['price']} | {r['cap']} | {r['per']} | "
-            f"{r['fwd_per']}{mark} | {r['pbr']} | {r['opm_fixed']} | {r['opm_est']} | {r['roe']} |"
+            f"{r['fwd_per']}{mark} | {r['fwd_eps']} | {r['pbr']} | {r['opm_fixed']} | {r['opm_est']} | {r['roe']} |"
         )
 
     ok = [r for r in results if not r["failed"]]
-    notes = ["단위 — 현재가: 원, PER·PBR: 배, OPM·ROE: %."]
+    notes = ["단위 — 현재가·EPS(E): 원, PER·PBR: 배, OPM·ROE: %. 선행PER = 현재가 ÷ EPS(E)."]
 
     fixed_labels = {r["fixed_label"] for r in ok if r["fixed_label"]}
     est_labels = {r["est_label"] for r in ok if r["est_label"]}
     if len(fixed_labels) == 1 and len(est_labels) == 1:
         notes.append(
-            f"`OPM확정`은 {fixed_labels.pop()} 확정치, `OPM추정`·`ROE`는 {est_labels.pop()} "
+            f"`OPM확정`은 {fixed_labels.pop()} 확정치, `OPM추정`·`EPS(E)`·`ROE(E)`는 {est_labels.pop()} "
             "**컨센서스 추정치**입니다. 확정치와 섞어 인용하지 마세요."
         )
     else:
         notes.append(
             "**결산기가 다른 종목이 섞여 있습니다** — `OPM확정`/`OPM추정`의 기준 연도가 종목마다 다르므로, "
             "비교 전에 stock_financials로 각 종목의 기준 연도를 확인하세요. "
-            "`OPM추정`·`ROE`는 컨센서스 추정치입니다."
+            "`OPM추정`·`EPS(E)`·`ROE(E)`는 컨센서스 추정치입니다."
         )
 
     if any(r["fallback"] for r in ok):
         notes.append(
-            "`*` 표시된 선행PER은 종목 상세에 값이 없어 **실적표의 추정 연도 PER로 보완**한 값입니다. "
-            "두 출처는 기준 시점이 달라 소수점 단위로 어긋날 수 있습니다."
+            "`*` 표시 종목은 종목 상세에 추정EPS가 없어 **실적표 추정 열의 EPS(E)**를 썼습니다. "
+            "선행PER은 다른 행과 똑같이 현재가 ÷ EPS(E)입니다."
         )
 
     notes.append(

@@ -177,6 +177,16 @@ def check_tool_output():
             if "확인되지 않은 시장 상태" in output:
                 print(f"    warn {fn_name}({name}) {output.splitlines()[-1]}")
                 quiet = False
+            # 가격이 어느 시세인지 늘 적혀 있어야 한다(2026-09-23 리뷰). 장중이 아니면 정규장 종가도.
+            required = {"stock_price": ["가격 기준:"], "stock_detail": ["[시세 기준"],
+                        "stock_investor_trend": ["종가: 그날 마지막 체결가"]}.get(fn_name, [])
+            if fn_name == "stock_price" and "정규장 실시간" not in output:
+                required = required + ["정규장 종가:"]
+            for label in required:
+                if label not in output:
+                    print(f"    FAIL {fn_name}({name}) '{label}' 표시가 없다")
+                    problems.append(f"{fn_name}({name}) 에 '{label}' 표시가 없다")
+                    quiet = False
             empties = [l.split(":")[0].strip() for l in output.split("\n") if blank.search(l)]
             if empties:
                 # 컨센서스가 없는 종목은 추정PER/추정EPS가 비는 게 정상이다.
@@ -293,9 +303,62 @@ def check_compare_table():
         print(f"    ok   시총·PER·PBR = 그 행의 현재가 기준 — {cells}칸 검산 일치, 후행 적자 {trailing_losses}행은 '적자'")
 
 
+def check_compare_sort():
+    print("\n" + "=" * 62)
+    print("[5] stock_compare 정렬 — 숫자는 순서대로, 적자·값 없음·조회 실패는 맨 아래")
+    print("=" * 62)
+    codes = ",".join(code for code, _ in STOCKS) + ",091990"
+    for sort_by, descending in [("선행PER", False), ("ROE(E)", True)]:
+        markdown = server.stock_compare(codes, sort_by=sort_by)
+        table = [l for l in markdown.split("\n") if l.startswith("|")]
+        if len(table) < 3:
+            print(f"    FAIL {sort_by} 정렬 표가 없다: {markdown[:60]}")
+            problems.append(f"stock_compare sort_by={sort_by} 가 표를 만들지 못했다")
+            continue
+        header = [c.strip() for c in table[0].strip("|").split("|")]
+        rows = [[c.strip() for c in l.strip("|").split("|")] for l in table[2:]]
+        values = [server._num(r[header.index(sort_by)].rstrip("*")) for r in rows]
+        failed = [r[0].endswith("조회 실패") for r in rows]
+        numeric = [v for v in values if v is not None]
+        # 숫자 행 → 숫자 아닌 행 → 조회 실패 행 순서여야 한다.
+        rank = [2 if f else (1 if v is None else 0) for v, f in zip(values, failed)]
+        ordered = numeric == sorted(numeric, reverse=descending) and rank == sorted(rank)
+        if ordered:
+            print(f"    ok   {sort_by} {'높은' if descending else '낮은'} 순 — 숫자 {len(numeric)}행, "
+                  f"아래로 {rank.count(1)}행·조회 실패 {rank.count(2)}행")
+        else:
+            print(f"    FAIL {sort_by} 정렬이 어긋났다: {[r[0][:8] for r in rows]}")
+            problems.append(f"stock_compare sort_by={sort_by} 정렬이 어긋났다")
+
+
+def check_regular_close():
+    print("\n" + "=" * 62)
+    print("[7] 정규장 종가 — 분봉 방식이 네이버 기준가(정규장 전일 종가)를 재현하는가")
+    print("=" * 62)
+    # 현재가 − 전일대비 = 기준가 = 직전 거래일 정규장 종가다. 현재가·일봉 종가는 애프터마켓 종가라
+    # 이 검산이 분봉(KRX 단독)이 정규장 종가를 준다는 유일한 근거다. 기준가가 언제 다음 날로
+    # 넘어가는지(자정·개장 전) 모르므로 최근 3거래일 중 하나와 맞으면 통과.
+    for code, name in [("005930", "삼성전자"), ("000660", "SK하이닉스"), ("451800", "한화리츠")]:
+        quote = server._fetch_quotes([code])[0].get(code) or {}
+        price = server._to_int(quote.get("closePrice"))
+        change = server._to_int(quote.get("compareToPreviousClosePrice"))
+        if price is None or change is None:
+            print(f"    FAIL {name} 시세를 받지 못했다")
+            problems.append(f"정규장 종가 검산용 시세 조회 실패: {name}")
+            continue
+        base = price - change
+        closes = {d: server._regular_close_on(code, d) for d in server._trading_dates(code)[-3:]}
+        hit = [d for d, c in closes.items() if c == base]
+        if hit:
+            print(f"    ok   {name} 기준가 {base:,} = {hit[-1]} 정규장 종가 (현재가 {price:,})")
+        else:
+            print(f"    FAIL {name} 기준가 {base:,}가 최근 정규장 종가 {closes}와 다르다")
+            problems.append(f"분봉 정규장 종가가 기준가와 안 맞는다: {name}")
+
+
 def check_edges():
     print("\n" + "=" * 62)
-    print("[5] 엣지 — 없는 코드는 실패를 말해야 한다")
+    print("[6] 엣지 — 없는 코드는 실패를 말해야 한다")
     print("=" * 62)
     output = server.stock_price("999999")
     if "실패" in output:
@@ -327,7 +390,9 @@ def main():
     check_detail_labels()
     check_tool_output()
     check_compare_table()
+    check_compare_sort()
     check_edges()
+    check_regular_close()
     print("\n" + "=" * 62)
     if problems:
         print(f"문제 {len(problems)}건")

@@ -25,6 +25,7 @@ import os
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
@@ -32,7 +33,9 @@ from starlette.responses import JSONResponse
 
 NAVER_STOCK_API = "https://m.stock.naver.com/api"
 NAVER_POLLING_API = "https://polling.finance.naver.com/api/realtime/domestic/stock"
+NAVER_CHART_API = "https://api.stock.naver.com/chart/domestic/item"
 NAVER_SEARCH_API = "https://ac.stock.naver.com/ac"
+KST = timezone(timedelta(hours=9))
 USER_AGENT = "Mozilla/5.0 (Macintosh; Apple Silicon) MCP-Korean-Stock/1.0"
 
 # 호스팅 환경(Render, Cloud Run 등)은 PORT 환경변수로 포트를 지정합니다.
@@ -113,10 +116,44 @@ def _with_caveat(basis):
     return f"{basis} — {caveat}" if caveat else basis
 
 
+def _trading_dates(code):
+    """최근 20일 안의 거래일 목록('YYYYMMDD', 오래된 순). 연휴가 길어도 직전 거래일이 들어온다."""
+    today = datetime.now(KST)
+    days = _fetch(f"{NAVER_CHART_API}/{code}/day?startDateTime={today - timedelta(days=20):%Y%m%d}0000"
+                  f"&endDateTime={today:%Y%m%d}2359")
+    return [d.get("localDate", "") for d in days] if isinstance(days, list) else []
+
+
+def _regular_close_on(code, date):
+    """그날 정규장 종가(정수). 분봉은 KRX 단독이라 15:30 이하 마지막 봉이 정규장 종가다.
+
+    현재가·일봉 종가는 애프터마켓 종가라 쓸 수 없다. 2026-09-23 삼성전자 285,500원·SK하이닉스
+    1,862,000원으로 뉴스의 정규장 종가와 일치했다(현재가는 286,500원·1,863,000원).
+    """
+    bars = _fetch(f"{NAVER_CHART_API}/{code}/minute?startDateTime={date}0900&endDateTime={date}1530")
+    if not isinstance(bars, list) or not bars:
+        return None
+    price = bars[-1].get("currentPrice")
+    return int(price) if isinstance(price, (int, float)) else None
+
+
+def _regular_close(code):
+    """가장 최근 거래일의 정규장 종가 → (가격, 'YYYY-MM-DD'), 없으면 None.
+
+    개장 전에 그날 봉이 먼저 생겨도 정규장 봉이 없으면 직전 거래일로 넘어간다.
+    """
+    for date in reversed(_trading_dates(code)[-2:]):
+        price = _regular_close_on(code, date)
+        if price:
+            return price, f"{date[:4]}-{date[4:6]}-{date[6:8]}"
+    return None
+
+
 @mcp.tool()
 def stock_price(code: str) -> str:
     """한국 주식 현재가를 조회합니다. 종목코드(예: 005930=삼성전자, 039440=에스티아이)를 입력하세요.
-    정규장이 끝나도 KRX 애프터마켓(16:00~20:00) 동안 현재가가 움직이므로 가격 기준을 함께 표시합니다."""
+    정규장이 끝나도 KRX 애프터마켓(16:00~20:00) 동안 현재가가 움직이므로 가격 기준을 함께 표시하고,
+    정규장 밖에서는 정규장 종가도 따로 보여줍니다."""
     quotes, fetched_at = _fetch_quotes([code])
     data = quotes.get(code)
     if not data:
@@ -128,12 +165,19 @@ def stock_price(code: str) -> str:
     ratio = data.get("fluctuationsRatio", "N/A")
     direction = data.get("compareToPreviousPrice", {}).get("text", "")
 
-    return (
-        f"{name} ({code})\n"
-        f"현재가: {price}원\n"
-        f"전일대비: {change}원 ({ratio}%) {direction}\n"
-        f"가격 기준: {_with_caveat(_price_basis(data))} (조회 {fetched_at})"
-    )
+    lines = [
+        f"{name} ({code})",
+        f"현재가: {price}원",
+        f"전일대비: {change}원 ({ratio}%) {direction}",
+    ]
+    basis = _price_basis(data)
+    # 장중엔 그날 종가가 아직 없다. 그 밖의 시간엔 현재가가 애프터마켓 가격이라 정규장 종가를 따로 준다.
+    if basis != "정규장 실시간":
+        regular = _regular_close(code)
+        if regular:
+            lines.append(f"정규장 종가: {regular[0]:,}원 ({regular[1]})")
+    lines.append(f"가격 기준: {_with_caveat(basis)} (조회 {fetched_at})")
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -169,6 +213,15 @@ def stock_detail(code: str) -> str:
             lines.append(f"목표주가 평균: {target}원")
         if recomm:
             lines.append(f"투자의견 평균: {recomm}")
+
+    # 이 표의 시세는 기준이 섞여 있다(2026-09-23 삼성전자: 시가 282,500·저가 280,750은 NXT 체결,
+    # KRX는 284,500·281,000). 시총·PER·PBR은 조회 시점 가격이라 저녁엔 애프터마켓 가격 기준이다.
+    quotes, fetched_at = _fetch_quotes([code])
+    if quotes.get(code):
+        lines.append("")
+        lines.append(f"[시세 기준 — 조회 {fetched_at}]")
+        lines.append(f"시총·PER·PBR 기준 가격: {_with_caveat(_price_basis(quotes[code]))}")
+        lines.append("시가·고가·저가·거래량·대금: KRX+NXT 통합 / 전일: 정규장 종가")
 
     return "\n".join(lines)
 
@@ -265,6 +318,9 @@ def stock_investor_trend(code: str, days: int = 10) -> str:
     lines = [
         f"종목 {code} 투자자 수급 — 최근 {len(data)}거래일",
         "단위: 주 (+순매수 / -순매도)",
+        # 네이버 일별 종가는 그날 마지막 체결가다 — 2026-09-22 삼성전자 277,500원(애프터마켓 종가),
+        # 정규장 종가 276,500원.
+        "종가: 그날 마지막 체결가 — 애프터마켓(16:00~20:00)에서 거래된 날은 애프터마켓 종가라 정규장 종가와 다를 수 있습니다",
         "",
     ]
     totals = {"foreignerPureBuyQuant": 0, "organPureBuyQuant": 0, "individualPureBuyQuant": 0}
@@ -360,6 +416,21 @@ def stock_financials(code: str, period: str = "quarter") -> str:
 # 스크리닝은 표 하나로 끝나야 하므로 시세는 한 요청으로, integration/finance는 종목별로 병렬로 받는다.
 _COMPARE_MAX = 50
 
+# 정렬 기준 열 → (결과 키, 높은 순인가). 밸류에이션 배수는 낮은 순, 규모·수익성은 높은 순.
+# 필터는 두지 않는다 — 행을 숨기면 조회 실패 행을 남기는 이유(누락을 알아채기)가 무너진다.
+_SORT_KEYS = {
+    "선행PER": ("fwd_per", False), "PER": ("per", False), "PBR": ("pbr", False),
+    "시총": ("cap_won", True), "ROE(E)": ("roe", True), "OPM추정": ("opm_est", True), "OPM확정": ("opm_fixed", True),
+}
+
+
+def _num(value):
+    """정렬용 숫자. '적자'·'-'처럼 숫자가 아니면 None."""
+    try:
+        return float(str(value).replace(",", ""))
+    except ValueError:
+        return None
+
 
 def _strip_unit(text):
     """'12.29배' / '46.56%' → '12.29' / '46.56'. 값이 없으면 '-'."""
@@ -445,6 +516,7 @@ def _compare_one(code, quote):
     per = _per(price, _strip_unit(infos.get("EPS")))
     price_val, bps = _to_int(price), _to_int(_strip_unit(infos.get("BPS")))
     pbr = f"{price_val / bps:.2f}" if price_val and bps and bps > 0 else _strip_unit(infos.get("PBR"))
+    cap_won = _to_int(quote.get("marketValueFull"))
 
     return {
         "code": code,
@@ -452,7 +524,8 @@ def _compare_one(code, quote):
         "name": quote.get("stockName", code),
         "price": price,
         "basis": _price_basis(quote),
-        "cap": _fmt_cap(_to_int(quote.get("marketValueFull"))),
+        "cap": _fmt_cap(cap_won),
+        "cap_won": cap_won,
         "per": per,
         "fwd_per": fwd_per,
         "fwd_eps": fwd_eps,
@@ -468,11 +541,13 @@ def _compare_one(code, quote):
 
 
 @mcp.tool()
-def stock_compare(codes: str) -> str:
+def stock_compare(codes: str, sort_by: str = "") -> str:
     """여러 종목의 밸류에이션·수익성을 한 표로 비교합니다 (스크리닝용).
 
     종목마다 stock_detail/stock_financials를 따로 부르는 대신 한 번에 받아옵니다.
     codes: 종목코드를 콤마로 구분 (예: "005930,000660,058470"). 최대 50개.
+    sort_by: 정렬 기준 열 (선택). 선행PER·PER·PBR은 낮은 순, 시총·ROE(E)·OPM추정·OPM확정은 높은 순이고
+        적자·값 없음은 맨 아래로 갑니다. 비우면 입력 순서.
     반환 항목: 현재가·시총·PER·선행PER·EPS(E)·PBR·영업이익률(최근 확정/추정)·ROE(E).
     시총·PER·선행PER·PBR은 모두 표의 현재가로 계산합니다(PER = 현재가 ÷ EPS, 선행PER = 현재가 ÷ EPS(E)).
     표 위에 현재가 기준(정규장 실시간 / 애프터마켓 / 장 마감)과 조회 시각을 표시합니다.
@@ -481,6 +556,10 @@ def stock_compare(codes: str) -> str:
     requested = [c.strip() for c in codes.replace("\n", ",").replace(" ", ",").split(",") if c.strip()]
     if not requested:
         return '종목코드를 하나 이상 입력하세요 (예: "005930,000660")'
+    sort = sort_by.replace(" ", "").upper()
+    sort = "ROE(E)" if sort == "ROE" else sort
+    if sort and sort not in _SORT_KEYS:
+        return f"sort_by는 {', '.join(_SORT_KEYS)} 중 하나여야 합니다 (입력: {sort_by})"
 
     targets = requested[:_COMPARE_MAX]
     omitted = requested[_COMPARE_MAX:]
@@ -491,6 +570,11 @@ def stock_compare(codes: str) -> str:
         results = list(pool.map(_compare_one, targets, [quotes.get(c) for c in targets]))
 
     ok = [r for r in results if not r["failed"]]
+    if sort:
+        field, descending = _SORT_KEYS[sort]
+        numeric = sorted((r for r in ok if _num(r[field]) is not None),
+                         key=lambda r: _num(r[field]), reverse=descending)
+        results = numeric + [r for r in ok if _num(r[field]) is None] + [r for r in results if r["failed"]]
     lines = [f"종목 비교 — {len(targets)}종목" + (f" (조회 {fetched_at})" if fetched_at else "")]
     # 기준은 대개 모든 행이 같다. 다르면(애프터마켓 중의 ETF 등) 소수 쪽만 종목명을 단다.
     bases = {}
@@ -500,6 +584,8 @@ def stock_compare(codes: str) -> str:
         main, *others = sorted(bases, key=lambda b: -len(bases[b]))
         lines.append(f"현재가 기준: {_with_caveat(main)}" + "".join(
             f". 단 {basis}: {', '.join(bases[basis])}" for basis in others))
+    if sort:
+        lines.append(f"정렬: {sort} {'높은' if _SORT_KEYS[sort][1] else '낮은'} 순 — 적자·값 없음·조회 실패는 맨 아래")
     lines += [
         "",
         "| 종목 | 현재가 | 시총 | PER | 선행PER | EPS(E) | PBR | OPM확정 | OPM추정 | ROE(E) |",

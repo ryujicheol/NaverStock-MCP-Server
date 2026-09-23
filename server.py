@@ -22,7 +22,6 @@
 
 import json
 import os
-import re
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -32,6 +31,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 NAVER_STOCK_API = "https://m.stock.naver.com/api"
+NAVER_POLLING_API = "https://polling.finance.naver.com/api/realtime/domestic/stock"
 NAVER_SEARCH_API = "https://ac.stock.naver.com/ac"
 USER_AGENT = "Mozilla/5.0 (Macintosh; Apple Silicon) MCP-Korean-Stock/1.0"
 
@@ -70,25 +70,69 @@ def _to_int(text):
         return None
 
 
+def _fetch_quotes(codes):
+    """여러 종목의 실시간 시세를 한 요청으로 받는다 → ({종목코드: 시세}, 조회 시각).
+
+    한 응답이라 모든 종목이 같은 시점 가격이고, 시총도 그 가격으로 계산돼 있다.
+    없는 코드·상장폐지 코드는 응답에서 조용히 빠지므로 호출자가 누락을 확인해야 한다.
+    """
+    joined = urllib.parse.quote(",".join(codes), safe=",")
+    data = _fetch(f"{NAVER_POLLING_API}/{joined}")
+    if not isinstance(data, dict) or "error" in data:
+        return {}, ""
+    quotes = {q.get("itemCode"): q for q in data.get("datas") or []}
+    return quotes, _fmt_datetime(data.get("time"))
+
+
+# 네이버 현재가는 KRX 시세다. 2026-09-14 KRX 애프터마켓(16:00~20:00 실시간 매매)이 열린 뒤로는
+# 정규장이 끝나도 20:00까지 움직이고, 20:00 이후의 '종가'도 애프터마켓 종가다 — 2026-09-22
+# 삼성전자는 정규장 종가 276,500원, 네이버 종가 277,500원(애프터마켓 종가). 전일대비는 다음 날
+# 기준가인 정규장 종가 대비다. ETF·ETN은 애프터마켓에서 거래되지 않아 그 시간에 장 마감으로 나온다.
+# 세션 값은 네이버 프런트엔드 코드와 같은 이름이다.
+_BASIS_CAVEAT = {
+    "정규장 실시간": "",
+    "애프터마켓 실시간": "20:00까지 바뀌며 정규장 종가(15:30)와 다를 수 있습니다",
+    "장 마감 후 마지막 체결가": "애프터마켓에서 거래된 종목은 애프터마켓 종가(20:00)라 정규장 종가(15:30)와 다를 수 있습니다",
+}
+
+
+def _price_basis(quote):
+    """현재가가 어느 시세인지 — _BASIS_CAVEAT의 키, 모르는 상태면 원래 값을 그대로."""
+    session, status = quote.get("marketSessionType"), quote.get("marketStatus")
+    if status == "OPEN" and session == "regularMarket":
+        return "정규장 실시간"
+    if status == "OPEN" and session == "afterMarket":
+        return "애프터마켓 실시간"
+    if status in ("CLOSE", "PREOPEN") or session == "preMarket":
+        return "장 마감 후 마지막 체결가"
+    return f"확인되지 않은 시장 상태 (marketStatus={status}, marketSessionType={session})"
+
+
+def _with_caveat(basis):
+    caveat = _BASIS_CAVEAT.get(basis)
+    return f"{basis} — {caveat}" if caveat else basis
+
+
 @mcp.tool()
 def stock_price(code: str) -> str:
-    """한국 주식 현재가를 조회합니다. 종목코드(예: 005930=삼성전자, 039440=에스티아이)를 입력하세요."""
-    data = _fetch(f"{NAVER_STOCK_API}/stock/{code}/basic")
-    if not data or "error" in data:
+    """한국 주식 현재가를 조회합니다. 종목코드(예: 005930=삼성전자, 039440=에스티아이)를 입력하세요.
+    정규장이 끝나도 KRX 애프터마켓(16:00~20:00) 동안 현재가가 움직이므로 가격 기준을 함께 표시합니다."""
+    quotes, fetched_at = _fetch_quotes([code])
+    data = quotes.get(code)
+    if not data:
         return f"종목코드 {code} 조회 실패"
 
     name = data.get("stockName", code)
     price = data.get("closePrice", "N/A")
     change = data.get("compareToPreviousClosePrice", "N/A")
     ratio = data.get("fluctuationsRatio", "N/A")
-    status = data.get("marketStatus", "")
     direction = data.get("compareToPreviousPrice", {}).get("text", "")
 
     return (
         f"{name} ({code})\n"
         f"현재가: {price}원\n"
         f"전일대비: {change}원 ({ratio}%) {direction}\n"
-        f"시장상태: {status}"
+        f"가격 기준: {_with_caveat(_price_basis(data))} (조회 {fetched_at})"
     )
 
 
@@ -313,7 +357,7 @@ def stock_financials(code: str, period: str = "quarter") -> str:
 
 # ── 멀티 종목 비교 ────────────────────────────────────────────────
 # 종목당 1회씩 부르면 호출 수가 종목 수만큼 늘고 컨텍스트도 그만큼 먹는다.
-# 스크리닝은 표 하나로 끝나야 하므로 basic/integration/finance를 묶어 병렬로 받는다.
+# 스크리닝은 표 하나로 끝나야 하므로 시세는 한 요청으로, integration/finance는 종목별로 병렬로 받는다.
 _COMPARE_MAX = 50
 
 
@@ -325,20 +369,16 @@ def _strip_unit(text):
     return cleaned if cleaned and cleaned != "N/A" else "-"
 
 
-def _short_cap(text):
-    """'1,601조 8,803억' → '1,601조', '5조 6,930억' → '5.7조'."""
-    if not isinstance(text, str):
+def _fmt_cap(won):
+    """시총(원) → '1,669조', '5.7조', '8,420억'. 값이 없으면 '-'."""
+    if not won:
         return "-"
-    jo = re.search(r"([\d,]+)\s*조", text)
-    eok = re.search(r"([\d,]+)\s*억", text)
-    jo_val = float(jo.group(1).replace(",", "")) if jo else 0.0
-    eok_val = float(eok.group(1).replace(",", "")) if eok else 0.0
-    if jo_val:
-        total = jo_val + eok_val / 10000
-        return f"{total:,.1f}조" if total < 100 else f"{total:,.0f}조"
-    if eok_val:
-        return f"{eok_val:,.0f}억"
-    return text.strip() or "-"
+    jo = won / 1e12
+    if jo >= 100:
+        return f"{jo:,.0f}조"
+    if jo >= 1:
+        return f"{jo:,.1f}조"
+    return f"{won / 1e8:,.0f}억"
 
 
 def _annual_frame(finance):
@@ -361,8 +401,8 @@ def _frame_cell(rows, titles, idx, name):
     return str(value) if value not in (None, "") else "-"
 
 
-def _fwd_per(price, eps):
-    """현재가 ÷ 추정EPS. 적자 추정이면 '적자', 값이 없으면 '-'.
+def _per(price, eps):
+    """현재가 ÷ EPS. 적자(EPS 음수)면 '적자', 값이 없으면 '-'.
 
     음수 PER은 "10배 이하" 같은 필터를 숫자로는 통과하고, 크기 순서도 뜻이 없다
     (적자가 클수록 0에 가깝다 — 카카오게임즈 -7.55가 엘앤에프 -80.25보다 적자가 크다).
@@ -375,48 +415,50 @@ def _fwd_per(price, eps):
     return f"{price_val / eps_val:.2f}"
 
 
-def _compare_one(code):
-    """한 종목의 비교용 지표. 실패해도 행은 남겨 스크리닝에서 누락을 알아채게 한다."""
-    basic = _fetch(f"{NAVER_STOCK_API}/stock/{code}/basic")
+def _compare_one(code, quote):
+    """한 종목의 비교용 지표. 시세가 없어도(없는·상장폐지 코드) 행은 남겨 스크리닝에서 누락을 알아채게 한다."""
+    if not quote:
+        return {"code": code, "failed": True}
     integration = _fetch(f"{NAVER_STOCK_API}/stock/{code}/integration")
     finance = _fetch(f"{NAVER_STOCK_API}/stock/{code}/finance/annual")
-
-    if not isinstance(basic, dict) or "error" in basic or not basic.get("stockName"):
-        return {"code": code, "failed": True}
 
     infos = {i["key"]: i["value"] for i in (integration.get("totalInfos") or [])} \
         if isinstance(integration, dict) else {}
     fixed_idx, est_idx, titles, rows = _annual_frame(finance if isinstance(finance, dict) else {})
 
-    # 선행PER은 표에 찍는 현재가 ÷ 추정EPS로 직접 계산한다. finance 추정 열의 PER은
-    # 현재가가 아닌 배치 시점 값(대개 전일 종가 기준)이라 옮겨 쓰면 틀린다(2026-09-23
-    # 케이씨텍: 12.46, 현재가 기준 13.48). integration 추정PER은 현재가 기준이지만 basic과
-    # 따로 받아 호가가 어긋날 수 있다. 추정EPS는 integration에 없는 종목이 있어 finance
+    # 가격이 들어가는 열(시총·PER·선행PER·PBR)은 모두 표에 찍는 현재가로 계산한다. 종목 상세의
+    # PER·PBR·시총도 현재가 기준이지만 요청이 따로라 가격이 어긋난다 — 2026-09-23 19시 애프터마켓
+    # 중 시총 상위 140종목 중 24개가 1~2틱(GS는 0.9%) 다른 가격 기준이었고, 삼성전자는 같은 현재가
+    # 285,500원에 시총이 1,666조/1,669조로 갈렸다. 가격이 같을 땐 네이버 PER = 현재가 ÷ EPS
+    # (99/99), PBR = 현재가 ÷ BPS(128/128)로 정확히 일치했다. 시총은 시세 응답의 값이 그 현재가 ×
+    # 상장주식수다. finance 추정 열의 PER은 배치 시점 값(대개 전일 종가 기준)이라 옮겨 쓰면
+    # 틀린다(케이씨텍: 12.46, 현재가 기준 13.48). 추정EPS는 integration에 없는 종목이 있어 finance
     # 추정 열로 보완하고 표시한다 — 두 출처가 다 있는 시총 상위 129종목에서 127개 일치, 2개는 1원 차.
     fwd_eps = _strip_unit(infos.get("추정EPS"))
     fallback = False
     if fwd_eps == "-":
         fwd_eps = _frame_cell(rows, titles, est_idx, "EPS")
         fallback = fwd_eps != "-"
-    price = basic.get("closePrice", "-")
-    fwd_per = _fwd_per(price, fwd_eps)
+    price = quote.get("closePrice", "-")
+    fwd_per = _per(price, fwd_eps)
     # 후행 PER도 적자면 '적자'로 쓴다. 네이버는 적자면 PER을 N/A로 줘서 값 없음과 구분이 안 된다.
-    trailing_eps = _to_int(_strip_unit(infos.get("EPS")))
-    per = "적자" if trailing_eps is not None and trailing_eps < 0 else _strip_unit(infos.get("PER"))
+    per = _per(price, _strip_unit(infos.get("EPS")))
+    price_val, bps = _to_int(price), _to_int(_strip_unit(infos.get("BPS")))
+    pbr = f"{price_val / bps:.2f}" if price_val and bps and bps > 0 else _strip_unit(infos.get("PBR"))
 
     return {
         "code": code,
         "failed": False,
-        "name": basic.get("stockName", code),
+        "name": quote.get("stockName", code),
         "price": price,
-        "status": basic.get("marketStatus", ""),
-        "cap": _short_cap(infos.get("시총")),
+        "basis": _price_basis(quote),
+        "cap": _fmt_cap(_to_int(quote.get("marketValueFull"))),
         "per": per,
         "fwd_per": fwd_per,
         "fwd_eps": fwd_eps,
         # 선행PER이 숫자가 아니면(적자·값 없음) `*`를 달지 않는다.
         "fallback": fallback and fwd_per not in ("-", "적자"),
-        "pbr": _strip_unit(infos.get("PBR")),
+        "pbr": pbr,
         "opm_fixed": _frame_cell(rows, titles, fixed_idx, "영업이익률"),
         "opm_est": _frame_cell(rows, titles, est_idx, "영업이익률"),
         "roe": _frame_cell(rows, titles, est_idx, "ROE"),
@@ -431,7 +473,9 @@ def stock_compare(codes: str) -> str:
 
     종목마다 stock_detail/stock_financials를 따로 부르는 대신 한 번에 받아옵니다.
     codes: 종목코드를 콤마로 구분 (예: "005930,000660,058470"). 최대 50개.
-    반환 항목: 현재가·시총·PER·선행PER(현재가 ÷ EPS(E))·EPS(E)·PBR·영업이익률(최근 확정/추정)·ROE(E).
+    반환 항목: 현재가·시총·PER·선행PER·EPS(E)·PBR·영업이익률(최근 확정/추정)·ROE(E).
+    시총·PER·선행PER·PBR은 모두 표의 현재가로 계산합니다(PER = 현재가 ÷ EPS, 선행PER = 현재가 ÷ EPS(E)).
+    표 위에 현재가 기준(정규장 실시간 / 애프터마켓 / 장 마감)과 조회 시각을 표시합니다.
     PER·선행PER은 적자면 '적자', 값이 없으면 '-'.
     """
     requested = [c.strip() for c in codes.replace("\n", ",").replace(" ", ",").split(",") if c.strip()]
@@ -439,13 +483,24 @@ def stock_compare(codes: str) -> str:
         return '종목코드를 하나 이상 입력하세요 (예: "005930,000660")'
 
     targets = requested[:_COMPARE_MAX]
-    overflow = len(requested) - len(targets)
+    omitted = requested[_COMPARE_MAX:]
 
+    # 시세는 한 요청으로 받아 모든 행이 같은 시점 가격이 되게 한다.
+    quotes, fetched_at = _fetch_quotes(targets)
     with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(_compare_one, targets))
+        results = list(pool.map(_compare_one, targets, [quotes.get(c) for c in targets]))
 
-    lines = [
-        f"종목 비교 — {len(targets)}종목",
+    ok = [r for r in results if not r["failed"]]
+    lines = [f"종목 비교 — {len(targets)}종목" + (f" (조회 {fetched_at})" if fetched_at else "")]
+    # 기준은 대개 모든 행이 같다. 다르면(애프터마켓 중의 ETF 등) 소수 쪽만 종목명을 단다.
+    bases = {}
+    for r in ok:
+        bases.setdefault(r["basis"], []).append(r["name"])
+    if bases:
+        main, *others = sorted(bases, key=lambda b: -len(bases[b]))
+        lines.append(f"현재가 기준: {_with_caveat(main)}" + "".join(
+            f". 단 {basis}: {', '.join(bases[basis])}" for basis in others))
+    lines += [
         "",
         "| 종목 | 현재가 | 시총 | PER | 선행PER | EPS(E) | PBR | OPM확정 | OPM추정 | ROE(E) |",
         "|------|------|------|------|------|------|------|------|------|------|",
@@ -460,10 +515,9 @@ def stock_compare(codes: str) -> str:
             f"{r['fwd_per']}{mark} | {r['fwd_eps']} | {r['pbr']} | {r['opm_fixed']} | {r['opm_est']} | {r['roe']} |"
         )
 
-    ok = [r for r in results if not r["failed"]]
     notes = [
-        "단위 — 현재가·EPS(E): 원, PER·PBR: 배, OPM·ROE: %. 선행PER = 현재가 ÷ EPS(E). "
-        "PER·선행PER은 적자면 `적자`, 값이 없으면 `-`입니다."
+        "단위 — 현재가·EPS(E): 원, PER·PBR: 배, OPM·ROE: %. 시총·PER·선행PER·PBR은 모두 표의 "
+        "현재가로 계산했습니다(선행PER = 현재가 ÷ EPS(E)). PER·선행PER은 적자면 `적자`, 값이 없으면 `-`입니다."
     ]
 
     fixed_labels = {r["fixed_label"] for r in ok if r["fixed_label"]}
@@ -490,13 +544,11 @@ def stock_compare(codes: str) -> str:
         "PER·EPS의 **후행 실적 반영 시점은 종목마다 다릅니다.** 종목 간 PER을 비교하기 전에 "
         "최근 분기 반영 여부를 확인하세요 — 미반영 종목의 낮은 PER은 이익 개선이 아니라 갱신 지연일 수 있습니다."
     )
-    if overflow > 0:
-        notes.append(f"입력한 {len(requested)}종목 중 **앞 {_COMPARE_MAX}개만 조회**했습니다(나머지 {overflow}개 생략).")
-
-    closed = [r["name"] for r in ok if r["status"] and r["status"] != "OPEN"]
-    if closed and len(closed) == len(ok):
-        lines.append("")
-        lines.append("※ 장 마감 상태이므로 현재가는 종가입니다.")
+    if omitted:
+        notes.append(
+            f"입력한 {len(requested)}종목 중 **앞 {_COMPARE_MAX}개만 조회**했습니다. "
+            f"생략된 {len(omitted)}종목: {', '.join(omitted)} — 따로 조회하세요."
+        )
 
     return "\n".join(lines) + "\n\n" + "\n".join(f"> {n}" for n in notes)
 

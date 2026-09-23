@@ -67,12 +67,16 @@ STOCKS = [
 
 # server.py가 각 엔드포인트에서 실제로 꺼내 쓰는 키
 REFERENCED = {
-    "basic": ["stockName", "closePrice", "compareToPreviousClosePrice",
-              "fluctuationsRatio", "marketStatus", "compareToPreviousPrice"],
+    "polling": ["stockName", "closePrice", "compareToPreviousClosePrice", "fluctuationsRatio",
+                "compareToPreviousPrice", "marketStatus", "marketSessionType", "marketValueFull"],
     "integration": ["stockName", "totalInfos", "consensusInfo"],
     "trend": ["bizdate", "closePrice", "foreignerPureBuyQuant",
               "organPureBuyQuant", "individualPureBuyQuant", "foreignerHoldRatio"],
     "finance/annual": ["financeInfo"],
+}
+URLS = {
+    "polling": "https://polling.finance.naver.com/api/realtime/domestic/stock/{code}",
+    "trend": "https://m.stock.naver.com/api/stock/{code}/trend?pageSize=10",
 }
 
 # stock_detail이 표에 싣는 라벨
@@ -99,13 +103,15 @@ def check_referenced_fields():
     print("[1] 코드가 참조하는 키가 응답에 있는가")
     print("=" * 62)
     for endpoint, keys in REFERENCED.items():
-        query = "?pageSize=10" if endpoint == "trend" else ""
+        url = URLS.get(endpoint, "https://m.stock.naver.com/api/stock/{code}/" + endpoint)
         seen = {key: 0 for key in keys}
         checked = 0
         for code, _ in STOCKS:
-            data = fetch(f"https://m.stock.naver.com/api/stock/{code}/{endpoint}{query}")
+            data = fetch(url.format(code=code))
             if isinstance(data, dict) and "__error__" in data:
                 continue
+            if endpoint == "polling":
+                data = data.get("datas") or []
             rows = data if isinstance(data, list) else [data]
             if not rows:
                 continue
@@ -167,6 +173,10 @@ def check_tool_output():
                 problems.append(f"{fn_name}({name}) 가 실패를 반환")
                 quiet = False
                 continue
+            # 네이버가 세션 값 이름을 바꾸면 가격 기준이 원래 값 그대로 나온다. 틀린 건 아니라 warn.
+            if "확인되지 않은 시장 상태" in output:
+                print(f"    warn {fn_name}({name}) {output.splitlines()[-1]}")
+                quiet = False
             empties = [l.split(":")[0].strip() for l in output.split("\n") if blank.search(l)]
             if empties:
                 # 컨센서스가 없는 종목은 추정PER/추정EPS가 비는 게 정상이다.
@@ -186,6 +196,13 @@ def check_compare_table():
         print("    FAIL 표가 만들어지지 않았다")
         problems.append("stock_compare 가 표를 만들지 못했다")
         return
+    # 현재가가 정규장인지 애프터마켓인지 표 위에 늘 적혀 있어야 한다(2026-09-23 리뷰: 안내가 사라졌다).
+    basis = next((l for l in markdown.split("\n") if l.startswith("현재가 기준:")), None)
+    if basis is None:
+        print("    FAIL 표 위에 현재가 기준 줄이 없다")
+        problems.append("stock_compare 에 현재가 기준 표시가 없다")
+    else:
+        print(f"    ok   {basis[:60]}")
     header = [c.strip() for c in lines[0].strip("|").split("|")]
     rows = [[c.strip() for c in l.strip("|").split("|")] for l in lines[2:]]
     ragged = sum(1 for r in rows if len(r) != len(header))
@@ -230,23 +247,50 @@ def check_compare_table():
         print(f"    ok   선행PER = 현재가 ÷ EPS(E) — {checked}행 검산 일치 (`*` 보완 {stars}행 포함), "
               f"적자 추정 {losses}행은 '적자'")
 
-    # 후행 PER도 적자면 '적자'여야 한다. 표에 후행 EPS가 없으니 종목 상세에서 따로 받아 대조한다.
-    trailing_losses = trailing_off = 0
-    for r in rows:
-        if len(r) != len(header) or r[0].endswith("조회 실패"):
-            continue
-        code = r[0].rsplit("(", 1)[-1].rstrip(")")
+    # 시총·PER·PBR도 그 행의 현재가로 계산돼야 한다. 종목 상세의 값을 옮기면 요청 시점이 달라
+    # 현재가와 틱이 어긋난다 — 2026-09-23 애프터마켓 중 삼성전자가 같은 현재가 285,500원에 시총
+    # 1,666조/1,669조로 갈렸다. 표에 EPS·BPS·주식수가 없으니 따로 받아 대조한다(주식수 = 시세
+    # 응답의 시총 ÷ 현재가). 후행 PER은 적자면 '적자'여야 한다.
+    valid = [r for r in rows if len(r) == len(header) and not r[0].endswith("조회 실패")]
+    codes = [r[0].rsplit("(", 1)[-1].rstrip(")") for r in valid]
+    polled = fetch(URLS["polling"].format(code=",".join(codes)))
+    quotes = {q.get("itemCode"): q for q in polled.get("datas") or []}
+    trailing_losses = cells = derived_off = 0
+    for r, code in zip(valid, codes):
+        price = server._to_int(r[col["현재가"]])
         data = fetch(f"https://m.stock.naver.com/api/stock/{code}/integration")
         infos = {} if "__error__" in data else {i["key"]: i["value"] for i in data.get("totalInfos", [])}
         eps = server._to_int(server._strip_unit(infos.get("EPS")))
-        is_loss = eps is not None and eps < 0
-        trailing_losses += is_loss
-        if is_loss != (r[col["PER"]] == "적자"):
-            trailing_off += 1
-            print(f"    FAIL 후행 PER {r[0]}: EPS {infos.get('EPS')}인데 {r[col['PER']]}")
-            problems.append(f"stock_compare 후행 PER의 적자 표시가 EPS와 어긋난다: {r[0]}")
-    if not trailing_off:
-        print(f"    ok   후행 PER — 적자 {trailing_losses}행은 '적자'")
+        bps = server._to_int(server._strip_unit(infos.get("BPS")))
+        quote = quotes.get(code) or {}
+        cap_full, close = server._to_int(quote.get("marketValueFull")), server._to_int(quote.get("closePrice"))
+        expected = {}
+        if eps is not None and eps < 0:
+            trailing_losses += 1
+            expected["PER"] = "적자"
+        elif price and eps:
+            expected["PER"] = price / eps
+        if price and bps and bps > 0:
+            expected["PBR"] = price / bps
+        if price and cap_full and close:
+            expected["시총"] = server._fmt_cap(round(cap_full / close) * price)
+        for label, want in expected.items():
+            got = r[col[label]]
+            if isinstance(want, float):
+                try:
+                    same = abs(float(got) - want) <= 0.006
+                except ValueError:
+                    same = False
+                want = f"{want:.2f}"
+            else:
+                same = got == want
+            cells += 1
+            if not same:
+                derived_off += 1
+                print(f"    FAIL {label} {r[0]}: 표 {got} ≠ 그 행의 현재가 {r[col['현재가']]} 기준 {want}")
+                problems.append(f"stock_compare {label}이 그 행의 현재가 기준이 아니다: {r[0]}")
+    if not derived_off:
+        print(f"    ok   시총·PER·PBR = 그 행의 현재가 기준 — {cells}칸 검산 일치, 후행 적자 {trailing_losses}행은 '적자'")
 
 
 def check_edges():
@@ -263,6 +307,19 @@ def check_edges():
     # 스크리닝에서 누락을 알아챌 수 없으므로 실패로 드러나야 한다.
     output = server.stock_price("124050")
     print(f"    {'ok  ' if '실패' in output else 'FAIL'} 소멸 종목(124050) → {output.splitlines()[0][:40]}")
+    # 한도를 넘긴 종목은 코드로 알려야 한다(2026-09-23 리뷰: '나머지 1개 생략'만 나와
+    # 51번째 삼성전자우가 빠진 걸 몰랐다). 한도를 2로 줄여 확인한다.
+    saved, server._COMPARE_MAX = server._COMPARE_MAX, 2
+    try:
+        output = server.stock_compare("005930,000660,005935")
+    finally:
+        server._COMPARE_MAX = saved
+    note = next((l for l in output.split("\n") if "생략" in l), "")
+    if "005935" in note:
+        print("    ok   한도 초과 → 생략된 코드(005935)를 적는다")
+    else:
+        print(f"    FAIL 한도 초과분의 코드를 알려주지 않는다: {note[:60]}")
+        problems.append("stock_compare 가 생략한 종목코드를 알려주지 않는다")
 
 
 def main():

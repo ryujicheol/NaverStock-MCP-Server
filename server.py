@@ -20,6 +20,7 @@
   - stock_compare        : 여러 종목 밸류에이션·수익성 비교 (스크리닝용, 최대 50종목)
 """
 
+import html
 import json
 import os
 import urllib.parse
@@ -61,6 +62,16 @@ def _fmt_datetime(raw):
     if text.isdigit() and len(text) in (12, 14):
         return f"{text[:4]}-{text[4:6]}-{text[6:8]} {text[8:10]}:{text[10:12]}"
     return text
+
+
+def _fmt_traded(value):
+    """시세의 localTradedAt '2026-09-23T20:00:00+09:00' → '2026-09-23 20:00'. 없으면 ''.
+
+    조회 시각만 적으면 휴장일·주말에 받은 값이 오늘 시세처럼 읽힌다 — 2026-09-24(추석 연휴)
+    조회의 현재가·전일대비는 9/23 20:00(애프터마켓 마감) 체결이었다.
+    """
+    text = str(value or "")
+    return f"{text[:10]} {text[11:16]}" if len(text) >= 16 and text[10] == "T" else text
 
 
 def _to_int(text):
@@ -125,13 +136,32 @@ def _trading_dates(code):
     return [d.get("localDate", "") for d in days] if isinstance(days, list) else []
 
 
+_SESSION_END = {}
+
+
+def _regular_session_end(date):
+    """그날 정규장이 끝난 시각 'HHMM'. 평소 15:30, 수능일처럼 장이 한 시간 늦게 열리고 닫히는 날은 16:30.
+
+    평소 15:20~15:30은 종가 단일가 매매라 분봉이 없다(2026-09-17~23, 4종목 모두 15:19 다음 15:30).
+    그 사이에 늘 거래되는 삼성전자 분봉이 있으면 연속매매가 이어진 날이다. 15:30으로 고정하면
+    수능일(2026-11-19 예정)엔 장중 15:30 가격을 정규장 종가로 적게 된다.
+    """
+    if date not in _SESSION_END:
+        bars = _fetch(f"{NAVER_CHART_API}/005930/minute?startDateTime={date}1521&endDateTime={date}1529")
+        if not isinstance(bars, list):
+            return "1530"  # 조회 실패는 저장하지 않고 평소 시각으로 본다
+        _SESSION_END[date] = "1630" if bars else "1530"
+    return _SESSION_END[date]
+
+
 def _regular_close_on(code, date):
-    """그날 정규장 종가(정수). 분봉은 KRX 단독이라 15:30 이하 마지막 봉이 정규장 종가다.
+    """그날 정규장 종가(정수). 분봉은 KRX 단독이라 정규장 마감 시각 이하 마지막 봉이 정규장 종가다.
 
     현재가·일봉 종가는 애프터마켓 종가라 쓸 수 없다. 2026-09-23 삼성전자 285,500원·SK하이닉스
     1,862,000원으로 뉴스의 정규장 종가와 일치했다(현재가는 286,500원·1,863,000원).
     """
-    bars = _fetch(f"{NAVER_CHART_API}/{code}/minute?startDateTime={date}0900&endDateTime={date}1530")
+    end = _regular_session_end(date)
+    bars = _fetch(f"{NAVER_CHART_API}/{code}/minute?startDateTime={date}0900&endDateTime={date}{end}")
     if not isinstance(bars, list) or not bars:
         return None
     price = bars[-1].get("currentPrice")
@@ -177,7 +207,9 @@ def stock_price(code: str) -> str:
         regular = _regular_close(code)
         if regular:
             lines.append(f"정규장 종가: {regular[0]:,}원 ({regular[1]})")
-    lines.append(f"가격 기준: {_with_caveat(basis)} (조회 {fetched_at})")
+    traded = _fmt_traded(data.get("localTradedAt"))
+    when = f"마지막 체결 {traded} / 조회 {fetched_at}" if traded else f"조회 {fetched_at}"
+    lines.append(f"가격 기준: {_with_caveat(basis)} ({when})")
     return "\n".join(lines)
 
 
@@ -220,10 +252,19 @@ def stock_detail(code: str) -> str:
     quotes, fetched_at = _fetch_quotes([code])
     quote = quotes.get(code.upper())
     if quote:
+        traded = _fmt_traded(quote.get("localTradedAt"))
         lines.append("")
         lines.append(f"[시세 기준 — 조회 {fetched_at}]")
-        lines.append(f"시총·PER·PBR 기준 가격: {_with_caveat(_price_basis(quote))}")
+        lines.append(f"시총·PER·PBR 기준 가격: {_with_caveat(_price_basis(quote))}"
+                     + (f" (마지막 체결 {traded})" if traded else ""))
         lines.append("시가·고가·저가·거래량·대금: KRX+NXT 통합 / 전일: 정규장 종가")
+        # NXT 거래 종목은 52주 밴드가 KRX 일봉 범위보다 넓다(2026-09-24: 삼성전자 380,000 vs
+        # KRX 일봉 최고 374,500, 리노공업·이오테크닉스·SK하이닉스도). NXT 없는 4종목은 같았다.
+        lines.append("52주 최고·최저: NXT 거래 종목은 KRX+NXT 통합이라 KRX 단독 범위보다 넓을 수 있음")
+        # 외인소진율은 한도 대비 비율이라 한도 있는 종목은 보유율과 다르고(한국전력 51.49% = 보유율
+        # 20.60% ÷ 한도 40%), 하루 늦게 갱신된다(9/24 조회 값이 9/22 기준, 수급 표는 9/23까지).
+        lines.append("외인소진율: 외국인 한도 대비 비율(한도 없는 종목은 보유율)이고 하루 늦은 값일 수 있음 — "
+                     "최신 보유율은 stock_investor_trend")
 
     return "\n".join(lines)
 
@@ -236,9 +277,13 @@ def stock_search(query: str) -> str:
     if not data or "error" in data:
         return f"'{query}' 검색 실패"
 
-    items = data.get("items", [])
+    # 검색은 해외 종목(애플 AAPL 등)도 돌려주지만 이 서버의 다른 도구는 국내 시세만 조회한다.
+    everything = data.get("items", [])
+    items = [i for i in everything if i.get("nationCode", "KOR") == "KOR"]
+    foreign = len(everything) - len(items)
     if not items:
-        return f"'{query}'에 해당하는 종목을 찾지 못했습니다"
+        extra = f" (해외 종목 {foreign}개는 제외 — 이 서버는 국내 종목만 조회합니다)" if foreign else ""
+        return f"'{query}'에 해당하는 국내 종목을 찾지 못했습니다{extra}"
 
     lines = [f"'{query}' 검색 결과:", ""]
     for item in items[:10]:
@@ -246,6 +291,9 @@ def stock_search(query: str) -> str:
         name = item.get("name", "")
         market = item.get("typeName", "")
         lines.append(f"  {name} ({code}) [{market}]")
+    if foreign:
+        lines.append("")
+        lines.append(f"(해외 종목 {foreign}개는 제외했습니다 — 이 서버는 국내 종목만 조회합니다)")
 
     return "\n".join(lines)
 
@@ -270,11 +318,15 @@ def market_index(market: str = "KOSPI") -> str:
     change = data.get("compareToPreviousClosePrice", "N/A")
     ratio = data.get("fluctuationsRatio", "N/A")
     direction = data.get("compareToPreviousPrice", {}).get("text", "")
+    # 날짜가 없으면 휴장일·주말에 받은 지수가 오늘 값처럼 읽힌다(2026-09-24 추석 연휴: 9/23 값).
+    traded = _fmt_traded(data.get("localTradedAt"))
+    status = {"OPEN": "장중", "CLOSE": "장 마감"}.get(data.get("marketStatus"), data.get("marketStatus") or "")
 
     return (
         f"{name}\n"
         f"현재: {price}\n"
         f"전일대비: {change} ({ratio}%) {direction}"
+        + (f"\n기준: {traded}" + (f" ({status})" if status else "") if traded else "")
     )
 
 
@@ -299,7 +351,9 @@ def stock_news(code: str) -> str:
     lines = [f"종목 {code} 최신 뉴스:", ""]
     for item in all_items[:5]:
         if isinstance(item, dict):
-            title = item.get("title", item.get("tit", ""))
+            # 제목은 HTML 엔티티째 온다(&quot;박스피에 지쳤다&quot;). 긴 제목의 '...' 절단은 네이버가
+            # 한 것이라(titleFull도 같은 값) 복원할 수 없다.
+            title = html.unescape(item.get("title", item.get("tit", "")))
             source = item.get("officeName", item.get("office", ""))
             date = _fmt_datetime(item.get("datetime", item.get("dt", "")))
             lines.append(f"  - {title} ({source}, {date})")
@@ -531,6 +585,7 @@ def _compare_one(code, quote):
         "preferred": not code.endswith("0") and "우" in name,
         "price": price,
         "basis": _price_basis(quote),
+        "traded": _fmt_traded(quote.get("localTradedAt")),
         "cap": _fmt_cap(cap_won),
         "cap_won": cap_won,
         "per": per,
@@ -594,6 +649,16 @@ def stock_compare(codes: str, sort_by: str = "") -> str:
         main, *others = sorted(bases, key=lambda b: -len(bases[b]))
         lines.append(f"현재가 기준: {_with_caveat(main)}" + "".join(
             f". 단 {basis}: {', '.join(bases[basis])}" for basis in others))
+    # 조회 시각만으로는 휴장일에 받은 표가 오늘 시세처럼 읽힌다. 체결일을 적고, 다른 날에 마지막으로
+    # 체결된 종목(거래정지 등)은 따로 단다.
+    dates = {}
+    for r in ok:
+        if r["traded"]:
+            dates.setdefault(r["traded"][:10], []).append(r["name"])
+    if dates:
+        main_date = max(dates, key=lambda d: (len(dates[d]), d))
+        lines.append(f"마지막 체결일: {main_date}" + "".join(
+            f". 단 {d}: {', '.join(dates[d])}" for d in sorted(dates) if d != main_date))
     if sort:
         lines.append(f"정렬: {sort} {'높은' if _SORT_KEYS[sort][1] else '낮은'} 순 — 적자·값 없음·조회 실패는 맨 아래")
     lines += [

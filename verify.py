@@ -178,7 +178,8 @@ def check_tool_output():
                 print(f"    warn {fn_name}({name}) {output.splitlines()[-1]}")
                 quiet = False
             # 가격이 어느 시세인지 늘 적혀 있어야 한다(2026-09-23 리뷰). 장중이 아니면 정규장 종가도.
-            required = {"stock_price": ["가격 기준:"], "stock_detail": ["[시세 기준"],
+            # 조회 시각만 있으면 휴장일에 받은 값이 오늘 시세처럼 읽힌다(2026-09-24 추석 연휴) — 체결 시각도.
+            required = {"stock_price": ["가격 기준:", "마지막 체결"], "stock_detail": ["[시세 기준", "마지막 체결"],
                         "stock_investor_trend": ["종가: 그날 마지막 체결가"]}.get(fn_name, [])
             if fn_name == "stock_price" and "정규장 실시간" not in output:
                 required = required + ["정규장 종가:"]
@@ -420,6 +421,35 @@ def check_edges():
         print("    ok   주석 전제 — 삼성전자우 EPS·추정EPS·BPS = 보통주 값")
 
 
+def check_labels_2026_09_24():
+    print("\n" + "=" * 62)
+    print("[8] 표시 — 지수 기준 시각, 뉴스 엔티티, 해외 종목, 정규장 마감 시각")
+    print("=" * 62)
+    output = server.market_index("KOSPI")
+    ok = "기준:" in output
+    print(f"    {'ok  ' if ok else 'FAIL'} market_index 에 기준 시각 → {output.splitlines()[-1]}")
+    if not ok:
+        problems.append("market_index 에 기준 시각이 없다")
+    # 네이버 뉴스 제목은 HTML 엔티티째 온다(&quot;…&quot;).
+    leaked = [code for code, _ in STOCKS[:3] if re.search(r"&(quot|amp|lt|gt|#\d+);", server.stock_news(code))]
+    print(f"    {'ok  ' if not leaked else 'FAIL'} 뉴스 제목에 HTML 엔티티 없음 {leaked or ''}")
+    if leaked:
+        problems.append(f"뉴스 제목에 HTML 엔티티가 남았다: {leaked}")
+    # 검색은 해외 종목도 돌려주지만 다른 도구는 국내만 조회한다 — 빠지고 안내가 붙어야 한다.
+    output = server.stock_search("애플")
+    ok = "AAPL" not in output and "해외 종목" in output
+    print(f"    {'ok  ' if ok else 'FAIL'} 해외 종목(애플) 제외 + 안내")
+    if not ok:
+        problems.append("stock_search 가 해외 종목을 걸러내지 않는다")
+    # 평소엔 15:20~15:30 종가 단일가 동안 분봉이 없다 — 최근 거래일이 16:30으로 잡히면 판정이 틀린 것.
+    # (수능일엔 16:30이 맞다. 그날 돌리면 이 검사가 FAIL로 알려준다.)
+    ends = {d: server._regular_session_end(d) for d in server._trading_dates("005930")[-3:]}
+    ok = all(v == "1530" for v in ends.values())
+    print(f"    {'ok  ' if ok else 'FAIL'} 최근 거래일 정규장 마감 {ends}")
+    if not ok:
+        problems.append(f"정규장 마감 시각 판정이 평일에 15:30이 아니다: {ends}")
+
+
 def main():
     check_referenced_fields()
     check_detail_labels()
@@ -428,6 +458,7 @@ def main():
     check_compare_sort()
     check_edges()
     check_regular_close()
+    check_labels_2026_09_24()
     print("\n" + "=" * 62)
     if problems:
         print(f"문제 {len(problems)}건")

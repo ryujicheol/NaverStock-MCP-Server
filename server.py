@@ -512,6 +512,14 @@ def _fmt_yyyymmdd(text):
     return f"{text[:4]}-{text[4:6]}-{text[6:8]}" if len(text) == 8 and text.isdigit() else text
 
 
+def _why(data):
+    """조회 실패 이유 — 'timed out'(응답 없음, 잠시 뒤 다시)과 'HTTP Error 404'(주소 변경)를 가려 읽게 한다.
+
+    WiseReport는 GitHub Actions 러너 IP에서 가끔 응답을 멈춘다(2026-09-25 CI 5회 중 2회, 타임아웃만).
+    """
+    return str(data.get("error"))[:80] if isinstance(data, dict) and "error" in data else "응답 형식이 다름"
+
+
 def _yoy_by_year(rows):
     """연간 표 행 간격이 12개월이 아니면(6개월 결산 리츠 등) YoY를 1년 전 같은 결산기 대비로 다시 계산한다.
 
@@ -560,7 +568,7 @@ def stock_consensus(code: str, period: str = "annual") -> str:
 
     table = _fetch(_consensus_url(code, 2, frq))
     if not isinstance(table, dict) or "error" in table:
-        return f"종목코드 {code} 컨센서스 조회 실패"
+        return f"종목코드 {code} 컨센서스 조회 실패 ({_why(table)})"
     rows = table.get("JsonData") or []
     if not rows:
         return (f"종목 {code} 컨센서스 데이터가 없습니다 — 우선주·ETF·상장폐지·없는 코드는 제공되지 않습니다"
@@ -607,7 +615,7 @@ def stock_consensus(code: str, period: str = "annual") -> str:
         name = f"{p[:4]}.{p[4:]}(E)"
         items = t.get("JsonData") if isinstance(t, dict) and "error" not in t else None
         if items is None:
-            trend_lines += ["", f"{name} 조회 실패"]
+            trend_lines += ["", f"{name} 조회 실패 ({_why(t)})"]
             continue
         if all(_cns_number(i.get("VAL1"), "") == "-" for i in items):
             continue  # 기준일 추정치가 없는 기간
@@ -620,7 +628,7 @@ def stock_consensus(code: str, period: str = "annual") -> str:
             if any(c != "-" for c in cells):  # 분기 추이의 ROE처럼 전부 빈 항목은 뺀다
                 trend_lines.append(f"| {acc} | " + " | ".join(cells) + " |")
     if not listed_ok:
-        trend_lines += ["", "추이 기간 목록 조회 실패"]
+        trend_lines += ["", f"추이 기간 목록 조회 실패 ({_why(listed)})"]
     if trend_lines:
         lines += ["", "[컨센서스 추이] 기준일 추정치와 그 전 시점의 추정치 — 상향·하향 확인용"] + trend_lines
 
@@ -628,7 +636,7 @@ def stock_consensus(code: str, period: str = "annual") -> str:
     for (_, account), s in zip(_CNS_SURPRISE, surprises):
         data = s.get("tableData") if isinstance(s, dict) and "error" not in s else None
         if not isinstance(data, dict):
-            failed.append(account)
+            failed.append(f"{account} ({_why(s)})")
             continue
         found = data.get("tableData") or []
         parsed.append((account, (data.get("tableHeaderData") or [{}])[0],

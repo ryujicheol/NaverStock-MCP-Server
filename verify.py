@@ -480,6 +480,28 @@ def _float(text):
         return None
 
 
+# WiseReport가 응답을 멈추거나 막는 실패 — GitHub 러너 IP에서 가끔 난다(2026-09-25 CI 5회 중 2회, 전부
+# 타임아웃. 로컬·Render에선 재현 안 됨). 우리 코드 문제가 아니라 경고로 건너뛴다. 404·형식 오류는 주소나
+# 응답 형식이 바뀐 것일 수 있어 그대로 FAIL이다.
+EXTERNAL = ("timed out", "HTTP Error 403", "HTTP Error 429", "HTTP Error 5", "Connection reset", "10054",
+            "Remote end closed")
+skipped = []
+
+
+def external_failure(text):
+    return any(marker in str(text) for marker in EXTERNAL)
+
+
+def skip_if_external(label, output):
+    """외부 실패면 경고를 찍고 True. 검사를 건너뛴 목록은 [9] 끝에 모아 보여 준다."""
+    if not external_failure(output):
+        return False
+    reason = next((line for line in str(output).splitlines() if "실패" in line or "__error__" in line), str(output))
+    print(f"    warn {label} — WiseReport 응답 없음, 건너뜀 ({reason[:70]})")
+    skipped.append(label)
+    return True
+
+
 # 추이 항목 → 실적·추정 표의 열, 허용 오차(억원은 표가 소수 한 자리, 추이가 정수 반올림)
 TREND_TO_TABLE = {
     "매출액(억원)": ("매출액", 1), "영업이익(억원)": ("영업이익", 1), "순이익(억원)": ("순이익", 1),
@@ -512,6 +534,8 @@ def check_consensus():
         for period in ("annual", "quarter"):
             tag = f"{name} {period}"
             output = server.stock_consensus(code, period)
+            if skip_if_external(tag, output):
+                continue
             sections = consensus_tables(output)
             # 분기 각주(연환산 아님)는 분기 표에만 붙어야 한다 — 연간 표에 붙은 회귀가 있었다(if/else 어긋남).
             if ("분기의 PER·ROE·EV/EBITDA" in output) != (period == "quarter"):
@@ -568,6 +592,9 @@ def check_consensus():
             trend_checked = trend_off = 0
             for title, trend_header, trend_rows in sections.get("컨센서스 추이") or []:
                 raw = fetch(server._consensus_url(code, 4, frq, yymm=title[:7].replace(".", "")))
+                if "__error__" in raw:
+                    skip_if_external(f"{tag} 추이 {title[:10]} 원본", raw) or print(
+                        f"    warn {tag} 추이 {title[:10]} 원본 조회 실패 — 원본 대조만 건너뜀 ({raw['__error__']})")
                 items = [] if "__error__" in raw else raw.get("JsonData") or []
                 shown_rows = {t[0]: t for t in trend_rows}
                 for item in items:
@@ -601,9 +628,14 @@ def check_consensus():
             # 서프라이즈(%) = (실적 − 추정) ÷ |추정| — 추정이 음수여도(SK하이닉스 2023 영업이익) 이 식이다.
             # FnGuide가 주는 %는 음수 추정에서 부호가 뒤집히거나 표의 추정과 안 맞을 때가 있어 도구가
             # 직접 계산하고, 원본과 다른 칸에만 ✎를 단다. 원본 %를 따로 받아 ✎ 판정도 대조한다.
-            shown = {}
+            shown, shown_ok = {}, True
             for acc, account in server._CNS_SURPRISE:
                 data = fetch(server._consensus_url(code, 5, frq, acc_cd=acc))
+                if "__error__" in data:
+                    # 원본 %를 못 받으면 ✎ 판정만 건너뛴다(도구 쪽 검산은 그대로 한다).
+                    shown_ok = False
+                    skip_if_external(f"{tag} 서프라이즈 원본 {account}", data) or print(
+                        f"    warn {tag} 서프라이즈 원본 {account} 조회 실패 — ✎ 대조만 건너뜀 ({data['__error__']})")
                 found = {} if "__error__" in data else data.get("tableData") or {}
                 header_row = (found.get("tableHeaderData") or [{}])[0]
                 for row in found.get("tableData") or []:
@@ -628,7 +660,7 @@ def check_consensus():
                         original = shown.get((r[0], r[1], head))
                         tolerance = (0.05 / abs(estimate) + abs(actual) * 0.05 / estimate ** 2) * 100 + 0.006
                         should = isinstance(original, (int, float)) and abs(original - computed) > tolerance
-                        if marked != should:
+                        if shown_ok and marked != should:
                             surprise_off += 1
                             print(f"    FAIL {tag} ✎ 판정 {r[0]} {r[1]} {head}: {cell}, 화면 {original}")
                             problems.append(f"stock_consensus({tag}) ✎ 판정이 어긋났다: {r[0]} {r[1]} {head}")
@@ -641,9 +673,12 @@ def check_consensus():
 
     # 추정이 없는 종목(지금은 에스티아이·한화리츠·엘브이엠씨홀딩스)은 그렇다고 말해야 하고, 추정이 있는
     # 종목엔 그 말이 없어야 한다. 종목의 커버리지가 바뀌어도 이 검사는 스스로 맞다.
-    mismatched, failed = [], []
+    mismatched, failed, checked_names = [], [], 0
     for code, name in STOCKS + [("039440", "에스티아이")]:
         output = server.stock_consensus(code)
+        if skip_if_external(f"{name} 추정 없음 안내", output):
+            continue
+        checked_names += 1
         main = (consensus_tables(output).get("실적·추정") or [None])[0]
         if main is None:
             failed.append(name)
@@ -655,14 +690,16 @@ def check_consensus():
     if failed or mismatched:
         print(f"    FAIL 표가 없음 {failed} / 추정 없음 안내 불일치 {mismatched}")
         problems.append(f"stock_consensus 표 없음 {failed} 또는 추정 없음 안내 불일치 {mismatched}")
-    else:
-        print(f"    ok   {len(STOCKS) + 1}종목 모두 표가 나오고, 추정이 빈 종목에만 '추정치가 없습니다'")
+    elif checked_names:
+        print(f"    ok   {checked_names}종목 모두 표가 나오고, 추정이 빈 종목에만 '추정치가 없습니다'")
     # 결산 주기가 6개월인 리츠는 원본 YoY에 직전 결산기 대비가 섞여 있다(한화리츠 2026.04: 원본 3.50%,
     # 1년 전 대비 7.53%). 도구의 YoY는 1년 전 같은 결산기 대비이거나, 그 결산기가 표에 없으면 비어야 한다.
     # 한화리츠가 결산 주기를 바꾸거나 상장폐지되면 다른 6개월 결산 리츠(롯데리츠 330590 등)로 바꿀 것.
     output = server.stock_consensus("451800")
     main = (consensus_tables(output).get("실적·추정") or [None])[0]
-    if main is None:
+    if skip_if_external("한화리츠 6개월 결산 YoY", output):
+        pass
+    elif main is None:
         print(f"    FAIL 한화리츠 표가 없다: {output[:60]}")
         problems.append("stock_consensus(한화리츠) 표가 없다 — 6개월 결산 YoY 검사를 못 했다")
     else:
@@ -689,10 +726,15 @@ def check_consensus():
             print(f"    ok   6개월 결산(한화리츠) YoY = 1년 전 같은 결산기 대비 {checked}행, 나머지는 빈칸 + 각주")
     # 우선주·없는 코드는 WiseReport가 빈 목록을 준다. 우선주 값을 주기 시작하면 안내를 고칠 것.
     for code, label in [("005935", "우선주(005935)"), ("999999", "없는 코드")]:
-        ok = "데이터가 없습니다" in server.stock_consensus(code)
+        output = server.stock_consensus(code)
+        if skip_if_external(label, output):
+            continue
+        ok = "데이터가 없습니다" in output
         print(f"    {'ok  ' if ok else 'FAIL'} {label} → 데이터 없음 안내")
         if not ok:
             problems.append(f"stock_consensus {label} 안내가 어긋났다")
+    if skipped:
+        print(f"    warn WiseReport 응답이 없어 건너뛴 검사 {len(skipped)}개 — 로컬에서 python verify.py로 다시 볼 것")
 
 
 def main():

@@ -510,33 +510,39 @@ def _float(text):
 
 
 def _plain(cell):
-    """'적자(-14.34)' → '-14.34'. 그 밖의 칸은 그대로."""
-    m = re.fullmatch(r"적자\((.*)\)", str(cell))
+    """'적자(-14.34)'·'자본잠식(-67.45)' → 괄호 안 값. 그 밖의 칸은 그대로."""
+    m = re.fullmatch(r"(?:적자|자본잠식)\((.*)\)", str(cell))
     return m.group(1) if m else cell
 
 
-def loss_label_problems(sections):
-    """적자 PER 표시(사용자 결정 2026-09-25: '적자(원래 값)')가 어긋난 칸.
+# 라벨 규칙(사용자 결정 2026-09-25): (기준 항목, 배수 항목, 라벨, 배수가 음수면 라벨인가).
+# EPS가 음수면 PER은 '적자(원래 값)'. BPS가 음수(자본잠식)면 PBR·ROE는 '자본잠식(원래 값)' — 보로노이
+# 2027E는 적자를 음수 자본으로 나눠 ROE +851.61%. ROE는 적자면 음수가 정상이라 음수 자체는 라벨 조건이 아니다.
+LABEL_RULES = [("EPS", "PER", "적자", True), ("BPS", "PBR", "자본잠식", True), ("BPS", "ROE", "자본잠식", False)]
 
-    EPS가 음수면 PER은 '적자'로 시작해야 하고, 흑자면 아니어야 한다. 부호만 붙은 음수 PER이 남으면
-    안 된다 — 음수 PER은 크기가 적자 규모에 반비례해 거꾸로 읽힌다(롯데케미칼 2024 EPS −39,988 → −1.50).
-    """
-    pairs = []
+
+def loss_label_problems(sections):
+    """적자·자본잠식 라벨이 규칙과 어긋난 칸(부호만 붙은 음수 배수 포함)."""
+    triples = []  # (위치, 기준 칸, 배수 칸, 라벨, 음수 배수도 라벨 대상인가)
     main = (sections.get("실적·추정") or [None])[0]
     if main:
         _, header, rows = main
-        col = {label: index for index, label in enumerate(header)}
-        pairs += [(r[0], r[col["EPS"]], r[col["PER"]]) for r in rows if len(r) == len(header)]
+        col = {label.split("(")[0]: index for index, label in enumerate(header)}
+        for base, target, label, by_value in LABEL_RULES:
+            triples += [(f"{r[0]} {target}", r[col[base]], r[col[target]], label, by_value)
+                        for r in rows if len(r) == len(header)]
     for title, header, rows in sections.get("컨센서스 추이") or []:
-        eps = next((r for r in rows if r[0].startswith("EPS")), None)
-        per = next((r for r in rows if r[0].startswith("PER")), None)
-        if eps and per:
-            pairs += [(f"{title[:10]} {header[n]}", eps[n], per[n]) for n in range(1, min(len(eps), len(per)))]
+        named = {r[0].split("(")[0]: r for r in rows}
+        for base, target, label, by_value in LABEL_RULES:
+            if base in named and target in named:
+                triples += [(f"{title[:10]} {header[n]} {target}", named[base][n], named[target][n], label, by_value)
+                            for n in range(1, min(len(named[base]), len(named[target])))]
     issues = []
-    for where, eps_cell, per_cell in pairs:
-        eps_value, loss = _float(eps_cell), per_cell.startswith("적자")
-        if (_float(per_cell) or 0) < 0 or (eps_value is not None and eps_value != 0 and (eps_value < 0) != loss):
-            issues.append(f"{where}: EPS {eps_cell}, PER {per_cell}")
+    for where, base_cell, cell, label, by_value in triples:
+        base, labeled = _float(base_cell), cell.startswith(label)
+        should = (base is not None and base < 0) or (by_value and (_float(_plain(cell)) or 0) < 0)
+        if (by_value and (_float(cell) or 0) < 0) or labeled != should:
+            issues.append(f"{where}: 기준 {base_cell}, 칸 {cell}")
     return issues
 
 
@@ -624,6 +630,9 @@ def check_consensus():
                         want = str(source.get(key) or "-")
                         if key == "PER" and (server._negative(source.get("PER")) or server._negative(source.get("EPS"))):
                             want = f"적자({want})" if want != "-" else "적자"
+                        if (key == "PBR" and (server._negative(source.get("PBR")) or server._negative(source.get("BPS")))
+                                or key == "ROE" and server._negative(source.get("BPS"))):
+                            want = f"자본잠식({want})" if want != "-" else "자본잠식"
                         if key == "YOY" and recomputed:
                             continue
                         if cell != want:
@@ -683,22 +692,31 @@ def check_consensus():
                         f"    warn {tag} 추이 {title[:10]} 원본 조회 실패 — 원본 대조만 건너뜀 ({raw['__error__']})")
                 items = [] if "__error__" in raw else raw.get("JsonData") or []
                 shown_rows = {t[0]: t for t in trend_rows}
-                eps_values = next(([i.get(f"VAL{n}") for n in range(1, 6)] for i in items
-                                   if str(i.get("ACC_NM", "")).startswith("EPS")), [None] * 5)
+                eps_values, bps_values = (next(([i.get(f"VAL{n}") for n in range(1, 6)] for i in items
+                                                if str(i.get("ACC_NM", "")).startswith(base)), [None] * 5)
+                                          for base in ("EPS", "BPS"))
+                neg = server._negative
                 for item in items:
                     acc_name, values = item.get("ACC_NM", ""), [item.get(f"VAL{n}") for n in range(1, 6)]
                     present = [isinstance(v, (int, float)) and v != 0 for v in values]
                     cells = shown_rows.get(acc_name)
                     digits = 1 if "(억원)" in acc_name else 0 if "(원)" in acc_name else 2
-                    # 적자 시점 PER은 '적자(원래 값)', 원래 값이 없으면 '적자'
-                    loss = [acc_name.startswith("PER") and (server._negative(v) or server._negative(e))
-                            for v, e in zip(values, eps_values)]
-                    if cells is None:
-                        wrong = any(present) or any(loss)
+                    # 적자 시점 PER은 '적자(원래 값)', 자본잠식 시점 PBR·ROE는 '자본잠식(원래 값)' — 원래 값이
+                    # 없으면 라벨만(LABEL_RULES와 같은 규칙).
+                    if acc_name.startswith("PER"):
+                        label, flags = "적자", [neg(v) or neg(e) for v, e in zip(values, eps_values)]
+                    elif acc_name.startswith("PBR"):
+                        label, flags = "자본잠식", [neg(v) or neg(b) for v, b in zip(values, bps_values)]
+                    elif acc_name.startswith("ROE"):
+                        label, flags = "자본잠식", [neg(b) for b in bps_values]
                     else:
-                        labels_wrong = any((cell != "적자" if not ok else not cell.startswith("적자(")) if is_loss
-                                           else cell.startswith("적자")
-                                           for ok, cell, is_loss in zip(present, cells[1:], loss))
+                        label, flags = "", [False] * 5
+                    if cells is None:
+                        wrong = any(present) or any(flags)
+                    else:
+                        labels_wrong = any((cell != label if not ok else not cell.startswith(label + "(")) if flag
+                                           else cell.startswith(("적자", "자본잠식"))
+                                           for ok, cell, flag in zip(present, cells[1:], flags))
                         values_wrong = any(_plain(cell) != "-" if not ok else
                                            _float(_plain(cell)) is None
                                            or abs(_float(_plain(cell)) - v) > 0.5 * 10 ** -digits + 1e-9
@@ -770,7 +788,7 @@ def check_consensus():
     # 추정이 없는 종목(지금은 에스티아이·한화리츠·엘브이엠씨홀딩스)은 그렇다고 말해야 하고, 추정이 있는
     # 종목엔 그 말이 없어야 한다. 종목의 커버리지가 바뀌어도 이 검사는 스스로 맞다.
     mismatched, failed, checked_names = [], [], 0
-    for code, name in STOCKS + [("039440", "에스티아이")]:
+    for code, name in STOCKS + [("039440", "에스티아이"), ("310210", "보로노이")]:
         output = server.stock_consensus(code)
         if skip_if_external(f"{name} 추정 없음 안내", output):
             continue
@@ -780,9 +798,16 @@ def check_consensus():
             failed.append(name)
             continue
         issues = loss_label_problems(consensus_tables(output))
+        # 각주는 해당 칸이 있을 때만 — 자본잠식 라벨, 음수 EV/EBITDA(값은 두고 각주만).
+        cells = [c for tables in consensus_tables(output).values() for _, _, rows in tables for r in rows for c in r[1:]]
+        ev_negative = any((_float(r[10]) or 0) < 0 for r in main[2] if len(r) == 11)
+        if any(c.startswith("자본잠식") for c in cells) != ("자본잠식)면" in output):
+            issues.append("자본잠식 각주가 칸과 어긋남")
+        if ev_negative != ("EV/EBITDA가 음수인 칸은" in output):
+            issues.append(f"EV/EBITDA 각주가 어긋남(음수 칸 {ev_negative})")
         if issues:
-            print(f"    FAIL {name} 적자 PER 표시가 어긋났다: {issues[:3]}")
-            problems.append(f"stock_consensus({name}) 적자 PER 표시가 어긋났다")
+            print(f"    FAIL {name} 적자·자본잠식 표시가 어긋났다: {issues[:3]}")
+            problems.append(f"stock_consensus({name}) 적자·자본잠식 표시가 어긋났다")
         estimates = [r for r in main[2] if "(E)" in r[0]]
         blank = all(c == "-" for r in estimates for c in r[1:])
         if blank != ("현재 컨센서스 추정치가 없습니다" in output):
@@ -837,6 +862,75 @@ def check_consensus():
         print(f"    warn WiseReport 응답이 없어 건너뛴 검사 {len(skipped)}개 — 로컬에서 python verify.py로 다시 볼 것")
 
 
+def check_financials():
+    print("\n" + "=" * 62)
+    print("[10] stock_financials — 적자 PER 표시, 분기 PER·ROE는 최근 4분기 합산(TTM)")
+    print("=" * 62)
+    # 전제: 분기 표의 PER·ROE는 최근 4분기 합산이다 — 12월 분기 값이 그해 연간 값과 같다(2026-09-25 20종목
+    # 모두, EPS·영업이익률은 0/20). 달라지면 분기 각주('최근 4분기 합산')와 PER 적자 판정 방식을 고칠 것.
+    broken, compared = [], 0
+    for code, name in STOCKS[:6] + [("011170", "롯데케미칼")]:
+        annual, quarter = (fetch(f"https://m.stock.naver.com/api/stock/{code}/finance/{p}") for p in ("annual", "quarter"))
+        if "__error__" in annual or "__error__" in quarter:
+            continue
+        a_info, q_info = annual.get("financeInfo") or {}, quarter.get("financeInfo") or {}
+        a_keys = {t.get("key") for t in a_info.get("trTitleList") or [] if t.get("isConsensus") != "Y"}
+        december = [t.get("key") for t in q_info.get("trTitleList") or []
+                    if t.get("isConsensus") != "Y" and str(t.get("key", "")).endswith("12") and t.get("key") in a_keys]
+        if not december:
+            continue
+
+        def value(info, title, key=december[-1]):
+            row = next((r for r in info.get("rowList") or [] if r.get("title") == title), {})
+            return ((row.get("columns") or {}).get(key) or {}).get("value")
+
+        compared += 1
+        for title in ("PER", "ROE"):
+            if value(a_info, title) != value(q_info, title):
+                broken.append(f"{name} {december[-1]} {title} 연간 {value(a_info, title)} vs 분기 {value(q_info, title)}")
+    if broken or not compared:
+        print(f"    FAIL 분기 PER·ROE가 최근 4분기 합산이 아닌 것 같다({compared}종목 비교): {broken[:3]}")
+        problems.append("stock_financials 분기 PER·ROE 기준(최근 4분기 합산) 전제가 깨졌다 — 각주를 고칠 것")
+    else:
+        print(f"    ok   전제 — 12월 분기 PER·ROE = 그해 연간 값 ({compared}종목)")
+
+    # 음수 PER은 '적자(원래 값)', 연간은 PER이 비어도 EPS가 음수면 '적자'(보로노이 2021). 분기는 PER 부호로만
+    # 판정한다 — 분기 EPS가 흑자여도 최근 4분기가 적자면 PER이 음수다(롯데케미칼 2026.03).
+    labeled = 0
+    for code, name in [("011170", "롯데케미칼"), ("310210", "보로노이"), ("005930", "삼성전자")]:
+        for period in ("annual", "quarter"):
+            tag = f"{name} {period}"
+            raw = fetch(f"https://m.stock.naver.com/api/stock/{code}/finance/{period}")
+            if "__error__" in raw:
+                print(f"    warn {tag} 원본 조회 실패 — 건너뜀 ({raw['__error__']})")
+                continue
+            info = raw.get("financeInfo") or {}
+            columns = {r.get("title"): r.get("columns") or {} for r in info.get("rowList") or []}
+            want = []
+            for key in [t.get("key") for t in info.get("trTitleList") or []]:
+                per = str((columns.get("PER", {}).get(key) or {}).get("value", "-"))
+                eps = (columns.get("EPS", {}).get(key) or {}).get("value")
+                if server._negative(per) or (period == "annual" and server._negative(eps)):
+                    per = f"적자({per})" if server._num(per) is not None else "적자"
+                want.append(per)
+            output = server.stock_financials(code, period)
+            line = next((l for l in output.split("\n") if l.startswith("PER")), "")
+            got = [c.strip() for c in line.split(": ", 1)[-1].split("|")]
+            labeled += sum(c.startswith("적자") for c in got)
+            wrong = []
+            if got != want:
+                wrong.append(f"PER {got} vs 기대 {want}")
+            if ("최근 4분기 합산(TTM)" in output) != (period == "quarter"):
+                wrong.append("분기 각주(최근 4분기 합산)가 어긋났다")
+            if ("PER은 음수(적자)면" in output) != any(c.startswith("적자") for c in got):
+                wrong.append("적자 각주가 어긋났다")
+            if wrong:
+                print(f"    FAIL {tag} {wrong[:2]}")
+                problems.append(f"stock_financials({tag}) 적자 PER 표시·각주가 어긋났다")
+    print(f"    ok   적자 PER 표시 {labeled}칸 확인 (흑자 종목은 숫자 그대로), 분기 각주·적자 각주 위치" if labeled else
+          "    warn 적자 PER 칸이 하나도 없다 — 검사 대상 종목을 적자 종목으로 바꿀 것")
+
+
 def main():
     check_referenced_fields()
     check_detail_labels()
@@ -847,6 +941,7 @@ def main():
     check_regular_close()
     check_labels_2026_09_24()
     check_consensus()
+    check_financials()
     print("\n" + "=" * 62)
     if problems:
         print(f"문제 {len(problems)}건")

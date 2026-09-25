@@ -462,16 +462,35 @@ def stock_financials(code: str, period: str = "quarter") -> str:
         "기간: " + " | ".join(headers),
         "",
     ]
+    eps_row = next(((r.get("columns") or {}) for r in rows if r.get("title") == "EPS"), {})
+    losses = False
     for row in rows:
         title = row.get("title", "")
         columns = row.get("columns") or {}
         # columns는 키 순서가 뒤섞여 있으므로 반드시 trTitleList 순서로 읽는다.
         values = [str((columns.get(k) or {}).get("value", "-")) for k in keys]
+        if title == "PER":
+            # 음수 PER은 거꾸로 읽혀 '적자(원래 값)'으로 쓴다(stock_consensus·stock_compare와 같다, 사용자 결정
+            # 2026-09-25) — 롯데케미칼 연간은 적자가 33배 커진 해에 −128.33 → −1.50. 분기 PER은 최근 4분기
+            # 합산 EPS 기준이라 그 분기 EPS 부호로는 판정하지 않는다(2026.03 분기 EPS +1,160원인데 PER −1.92).
+            for n, k in enumerate(keys):
+                eps_loss = period_code == "annual" and _negative((eps_row.get(k) or {}).get("value"))
+                if _negative(values[n]) or eps_loss:
+                    values[n], losses = _labeled(values[n], "적자"), True
         unit = _FINANCE_UNITS.get(title)
         suffix = f" ({unit})" if unit else ""
         lines.append(f"{title}{suffix}: " + " | ".join(values))
 
-    return "\n".join(lines)
+    notes = []
+    if period_code == "quarter":
+        # 20종목 모두 2025.12 분기의 PER·ROE가 2025 연간 값과 같고 EPS·영업이익률은 달랐다(2026-09-25).
+        # PER = 분기 말 종가 ÷ 최근 4분기 EPS 합 — 롯데케미칼 2026.03 80,600 ÷ −42,002 = −1.92, 삼성전자 13.51.
+        notes.append("분기 PER·ROE는 최근 4분기 합산(TTM) 기준입니다(PER = 분기 말 주가 ÷ 최근 4분기 EPS 합). "
+                     "EPS·이익률 등 나머지는 그 분기 값이라, 분기 EPS가 흑자여도 최근 4분기가 적자면 PER은 적자로 나옵니다.")
+    if losses:
+        notes.append("PER은 음수(적자)면 `적자`로 적고 괄호에 원래 값을 남깁니다 — 음수 PER은 크기가 적자 규모에 "
+                     "반비례해, 그 크기나 변화로 적자폭을 판단하면 거꾸로 읽힙니다. 적자폭은 EPS·순이익으로 보세요.")
+    return "\n".join(lines) + ("\n\n" + "\n".join(f"> {n}" for n in notes) if notes else "")
 
 
 # ── 컨센서스 ─────────────────────────────────────────────────────
@@ -526,9 +545,9 @@ def _negative(value):
     return number is not None and number < 0
 
 
-def _loss_per(cell):
-    """적자 기간의 PER 칸 → '적자(-14.34)'. 원래 값이 없으면 '적자'."""
-    return f"적자({cell})" if cell and cell != "-" else "적자"
+def _labeled(cell, label):
+    """음수라 배수로서 뜻이 없는 칸 → '적자(-14.34)'·'자본잠식(-67.45)'. 원래 값이 숫자가 아니면 라벨만."""
+    return f"{label}({cell})" if _num(cell) is not None else label
 
 
 def _yoy_by_year(rows):
@@ -612,8 +631,8 @@ def stock_consensus(code: str, period: str = "annual") -> str:
     lines += ["", "[실적·추정]", "| 기간 | " + " | ".join(n for _, n in _CNS_COLUMNS) + " |",
               "|" + "------|" * (len(_CNS_COLUMNS) + 1)]
     cycle = _yoy_by_year(rows) if frq == 0 else None
-    per_at = [k for k, _ in _CNS_COLUMNS].index("PER")
-    losses = False
+    per_at, pbr_at, roe_at = ([k for k, _ in _CNS_COLUMNS].index(key) for key in ("PER", "PBR", "ROE"))
+    losses = impaired = False
     for index, r in enumerate(rows):
         # 재무 기준이 기간마다 다르면(별도 → 연결 전환 등) 기간 옆에 적는다.
         basis = f" {r['MAIN']}" if len(bases) > 1 and r.get("MAIN") else ""
@@ -622,7 +641,14 @@ def stock_consensus(code: str, period: str = "annual") -> str:
         # 적자 규모에 반비례해 거꾸로 읽힌다(롯데케미칼 2027E: EPS −1,366 → −5,638로 적자가 4배 커지는 동안
         # PER은 −46.04 → −10.68로 0에 가까워졌다). 괄호의 원래 값은 네이버 화면 대조용이다.
         if _negative(r.get("PER")) or _negative(r.get("EPS")):
-            cells[per_at], losses = _loss_per(cells[per_at]), True
+            cells[per_at], losses = _labeled(cells[per_at], "적자"), True
+        # 자본잠식(BPS 음수)이면 PBR·ROE도 같은 식으로 — 보로노이 2027E BPS −2,184원 → PBR −67.45, 그리고 적자
+        # (순이익 −660억)를 음수 자본으로 나눠 ROE가 +851.61%로 나온다. 실적(A) 행은 원본이 PBR을 비워 둔다
+        # (씨엠티엑스 2024 BPS −8,811원).
+        if _negative(r.get("PBR")) or _negative(r.get("BPS")):
+            cells[pbr_at], impaired = _labeled(cells[pbr_at], "자본잠식"), True
+        if _negative(r.get("BPS")):
+            cells[roe_at] = _labeled(cells[roe_at], "자본잠식")
         lines.append(f"| {r.get('YYMM', '')}{basis} | " + " | ".join(cells) + " |")
     estimates = [r for r in rows if "(E)" in r.get("YYMM", "")]
     if not any(r.get(k) for r in estimates for k, _ in _CNS_COLUMNS):
@@ -641,13 +667,22 @@ def stock_consensus(code: str, period: str = "annual") -> str:
                         f"| 항목 | {_fmt_yyyymmdd(items[0].get('DT'))} | " + " | ".join(_CNS_TREND_COLUMNS) + " |",
                         "|" + "------|" * (len(_CNS_TREND_COLUMNS) + 2)]
         eps = next((i for i in items if str(i.get("ACC_NM", "")).startswith("EPS")), {})
+        bps = next((i for i in items if str(i.get("ACC_NM", "")).startswith("BPS")), {})
         for i in items:
             acc = i.get("ACC_NM", "")
             cells = [_cns_number(i.get(f"VAL{n}"), acc) for n in range(1, 6)]
             if acc.startswith("PER"):  # 표와 같이 그 시점 EPS가 음수면 '적자(원래 값)'
                 for n in range(1, 6):
                     if _negative(i.get(f"VAL{n}")) or _negative(eps.get(f"VAL{n}")):
-                        cells[n - 1], losses = _loss_per(cells[n - 1]), True
+                        cells[n - 1], losses = _labeled(cells[n - 1], "적자"), True
+            if acc.startswith("PBR"):  # 그 시점 BPS가 음수면 '자본잠식(원래 값)'
+                for n in range(1, 6):
+                    if _negative(i.get(f"VAL{n}")) or _negative(bps.get(f"VAL{n}")):
+                        cells[n - 1], impaired = _labeled(cells[n - 1], "자본잠식"), True
+            if acc.startswith("ROE"):  # 자본이 음수면 ROE 부호가 뒤집힌다(적자인데 양수)
+                for n in range(1, 6):
+                    if _negative(bps.get(f"VAL{n}")):
+                        cells[n - 1], impaired = _labeled(cells[n - 1], "자본잠식"), True
             if any(c != "-" for c in cells):  # 분기 추이의 ROE처럼 전부 빈 항목은 뺀다
                 trend_lines.append(f"| {acc} | " + " | ".join(cells) + " |")
     if not listed_ok:
@@ -715,6 +750,14 @@ def stock_consensus(code: str, period: str = "annual") -> str:
         notes.append("PER은 EPS가 음수(적자)면 `적자`로 적고 괄호에 원래 값(네이버 화면의 음수 PER)을 남깁니다. "
                      "괄호 숫자는 화면 대조용일 뿐입니다 — 음수 PER의 크기는 적자 규모에 반비례하고 주가 변동도 섞여서, "
                      "그 크기나 변화로 적자폭을 판단하면 거꾸로 읽힙니다. 적자폭은 EPS·순이익으로 보세요.")
+    if impaired:
+        notes.append("PBR·ROE는 BPS가 음수(자본잠식)면 `자본잠식`으로 적고 괄호에 원래 값을 남깁니다 — 자본이 음수면 "
+                     "두 값 모두 뜻이 없습니다(적자를 음수 자본으로 나눠 ROE가 큰 양수로 나오기도 합니다).")
+    # 음수 EV/EBITDA는 둘 중 하나다 — EBITDA 적자(한국전력 2022 영업이익 −326,552억), 또는 영업이익은 흑자인데
+    # EV가 음수(다우데이타 2025 영업이익 15,999억, EV/EBITDA −18.53). 표만으론 어느 쪽인지 못 가려 값은 둔다.
+    if any(_negative(r.get("EV")) for r in rows):
+        notes.append("EV/EBITDA가 음수인 칸은 EBITDA가 적자이거나 EV(시가총액 + 순차입금)가 음수(순현금이 시가총액보다 "
+                     "큼)인 경우라, 배수로 비교하면 안 됩니다.")
     # (E)의 PER은 기준일 정규장 종가 ÷ EPS(E)다 — 2026-09-23 삼성전자 285,500 ÷ 47,922 = 5.96(애프터마켓
     # 종가 286,500이면 5.98). (A)는 결산기 말 종가다 — 2024년 53,200 ÷ 4,950 = 10.75, 2023년 78,500 ÷ 2,131 = 36.84.
     if frq == 0:
@@ -723,8 +766,11 @@ def stock_consensus(code: str, period: str = "annual") -> str:
     else:
         # 분기 값은 분기 하나로 계산한다 — 2026.09(E) PER 20.97 = 285,500 ÷ 분기 EPS 13,616,
         # 2026.06(A) ROE 13.72% = 분기 순이익 712,695억 ÷ 평균 지배주주 자본 5,195,148억.
+        # stock_financials(모바일 API)의 분기 PER·ROE는 최근 4분기 합산이다 — 삼성전자 2026.06 PER이 여기 31.16,
+        # 그쪽 14.98(334,000 ÷ 최근 4분기 EPS 22,358).
         notes.append("분기의 PER·ROE·EV/EBITDA는 그 분기 실적 하나로 계산한 값이라(연환산 아님) 연간 값과 "
-                     "비교하면 안 됩니다. (E)의 PER은 기준일 정규장 종가 기준입니다.")
+                     "비교하면 안 됩니다. (E)의 PER은 기준일 정규장 종가 기준입니다. stock_financials의 분기 PER·ROE는 "
+                     "최근 4분기 합산(TTM) 기준이라 이 표와 값이 다릅니다.")
     if cycle:
         # 6개월 결산이면 PER = 결산기 말 종가 ÷ 6개월 EPS다 — 한화리츠 2026.04 5,970 ÷ 97 = 61.55(표 61.59).
         notes.append("결산 주기가 1년이 아닙니다(6개월 결산 리츠 등) — 표의 한 행이 한 결산기라 PER·ROE는 그 결산기 "

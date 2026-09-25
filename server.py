@@ -512,6 +512,37 @@ def _fmt_yyyymmdd(text):
     return f"{text[:4]}-{text[4:6]}-{text[6:8]}" if len(text) == 8 and text.isdigit() else text
 
 
+def _yoy_by_year(rows):
+    """연간 표 행 간격이 12개월이 아니면(6개월 결산 리츠 등) YoY를 1년 전 같은 결산기 대비로 다시 계산한다.
+
+    원본 YoY엔 직전 결산기 대비가 섞여 있다(2026-09-25 6개월 결산 리츠 5종목 모두 — 한화리츠 2025.10은
+    1년 전 대비 56.41%, 2026.04는 직전 결산기 대비 3.50%이고 1년 전 대비는 7.53%). 12개월 간격이면
+    직전 = 1년 전이라 원본이 맞는다. → (행별 YoY 문자열, 화면과 다른 칸) 또는 간격이 12개월이면 None.
+    """
+    try:
+        months = [int(r["YYMM"][:4]) * 12 + int(r["YYMM"][5:7]) for r in rows]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if all(b - a == 12 for a, b in zip(months, months[1:])):
+        return None
+    sales = {m: _num(r.get("SALES") or "-") for m, r in zip(months, rows)}
+    values, differ = [], []
+    for m, r in zip(months, rows):
+        now, before, shown = sales[m], sales.get(m - 12), _num(r.get("YOY") or "-")
+        if now is None or not before:
+            values.append("-")  # 1년 전 결산기가 표에 없다
+            continue
+        ratio = (now / before - 1) * 100
+        tolerance = (0.05 / before + now * 0.05 / before ** 2) * 100 + 0.006  # 표의 매출액이 소수 한 자리
+        if shown is not None and abs(shown - ratio) <= tolerance:
+            values.append(r["YOY"])
+        else:
+            values.append(f"{ratio:.2f}✎")
+            if shown is not None:
+                differ.append(f"{r.get('YYMM', '')} {shown:.2f}%")
+    return values, differ
+
+
 @mcp.tool()
 def stock_consensus(code: str, period: str = "annual") -> str:
     """종목의 애널리스트 컨센서스(FnGuide)를 조회합니다 — 네이버 증권 종목분석 → 컨센서스 탭과 같은 데이터.
@@ -561,10 +592,12 @@ def stock_consensus(code: str, period: str = "annual") -> str:
 
     lines += ["", "[실적·추정]", "| 기간 | " + " | ".join(n for _, n in _CNS_COLUMNS) + " |",
               "|" + "------|" * (len(_CNS_COLUMNS) + 1)]
-    for r in rows:
+    cycle = _yoy_by_year(rows) if frq == 0 else None
+    for index, r in enumerate(rows):
         # 재무 기준이 기간마다 다르면(별도 → 연결 전환 등) 기간 옆에 적는다.
         basis = f" {r['MAIN']}" if len(bases) > 1 and r.get("MAIN") else ""
-        lines.append(f"| {r.get('YYMM', '')}{basis} | " + " | ".join(str(r.get(k) or "-") for k, _ in _CNS_COLUMNS) + " |")
+        cells = [cycle[0][index] if cycle and k == "YOY" else str(r.get(k) or "-") for k, _ in _CNS_COLUMNS]
+        lines.append(f"| {r.get('YYMM', '')}{basis} | " + " | ".join(cells) + " |")
     estimates = [r for r in rows if "(E)" in r.get("YYMM", "")]
     if not any(r.get(k) for r in estimates for k, _ in _CNS_COLUMNS):
         lines += ["", "현재 컨센서스 추정치가 없습니다."]
@@ -657,6 +690,13 @@ def stock_consensus(code: str, period: str = "annual") -> str:
         # 2026.06(A) ROE 13.72% = 분기 순이익 712,695억 ÷ 평균 지배주주 자본 5,195,148억.
         notes.append("분기의 PER·ROE·EV/EBITDA는 그 분기 실적 하나로 계산한 값이라(연환산 아님) 연간 값과 "
                      "비교하면 안 됩니다. (E)의 PER은 기준일 정규장 종가 기준입니다.")
+    if cycle:
+        # 6개월 결산이면 PER = 결산기 말 종가 ÷ 6개월 EPS다 — 한화리츠 2026.04 5,970 ÷ 97 = 61.55(표 61.59).
+        notes.append("결산 주기가 1년이 아닙니다(6개월 결산 리츠 등) — 표의 한 행이 한 결산기라 PER·ROE는 그 결산기 "
+                     "실적 기준(연환산 아님)입니다. YoY는 1년 전 같은 결산기 대비로 다시 계산했습니다: 네이버 화면의 "
+                     "YoY엔 직전 결산기 대비가 섞여 있어 다른 칸은 ✎"
+                     + (f"(화면 값: {', '.join(cycle[1])})" if cycle[1] else "")
+                     + ", 1년 전 결산기가 표에 없는 행은 비웠습니다.")
     # 삼성전자 2025 영업이익: 서프라이즈 실적 435,300억(2026/01/08 잠정 발표) vs 위 표 436,010.5억(확정).
     notes.append("어닝서프라이즈의 실적은 발표일 당시 값이라(잠정실적을 내는 회사는 잠정치) 위 표의 확정치와 "
                  "다를 수 있습니다.")

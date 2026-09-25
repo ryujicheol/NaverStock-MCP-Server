@@ -480,6 +480,14 @@ def _float(text):
         return None
 
 
+# 추이 항목 → 실적·추정 표의 열, 허용 오차(억원은 표가 소수 한 자리, 추이가 정수 반올림)
+TREND_TO_TABLE = {
+    "매출액(억원)": ("매출액", 1), "영업이익(억원)": ("영업이익", 1), "순이익(억원)": ("순이익", 1),
+    "EPS(원)": ("EPS", 1), "BPS(원)": ("BPS", 1), "PER(배)": ("PER", 0.011), "PBR(배)": ("PBR", 0.011),
+    "ROE(%)": ("ROE(%)", 0.011),
+}
+
+
 def check_consensus():
     print("\n" + "=" * 62)
     print("[9] stock_consensus — 추정 기간 전부, 모바일 API와 같은 컨센서스, 산술 검산")
@@ -503,7 +511,12 @@ def check_consensus():
     for code, name in [("005930", "삼성전자"), ("000660", "SK하이닉스")]:
         for period in ("annual", "quarter"):
             tag = f"{name} {period}"
-            sections = consensus_tables(server.stock_consensus(code, period))
+            output = server.stock_consensus(code, period)
+            sections = consensus_tables(output)
+            # 분기 각주(연환산 아님)는 분기 표에만 붙어야 한다 — 연간 표에 붙은 회귀가 있었다(if/else 어긋남).
+            if ("분기의 PER·ROE·EV/EBITDA" in output) != (period == "quarter"):
+                print(f"    FAIL {tag} 분기 각주가 {'없다' if period == 'quarter' else '연간 표에 붙었다'}")
+                problems.append(f"stock_consensus({tag}) 분기 각주가 어긋났다")
             main = (sections.get("실적·추정") or [None])[0]
             if main is None:
                 print(f"    FAIL {tag} 실적·추정 표가 없다")
@@ -512,7 +525,7 @@ def check_consensus():
             _, header, rows = main
             col = {label: index for index, label in enumerate(header)}
             by_period = {r[0][:7]: r for r in rows}
-            estimates = [r for r in rows if "(E)" in r[0] and r[col["매출액"]] != "-"]
+            estimates = [r for r in rows if "(E)" in r[0] and any(c != "-" for c in r[1:])]
             # 모바일 API는 추정이 1개 기간뿐이었다 — 이 도구를 만든 이유다.
             if len(estimates) < 2:
                 print(f"    FAIL {tag} 추정 기간이 {len(estimates)}개뿐이다")
@@ -527,6 +540,8 @@ def check_consensus():
             same = first is not None and head is not None and first[0][:7] == head.get("title", "")[:7]
             for label, mobile_label, tolerance in [("매출액", "매출액", 1), ("영업이익", "영업이익", 1), ("EPS", "EPS", 0)]:
                 got, want = _float(first[col[label]]) if first else None, _float(values.get(mobile_label))
+                if first and got is None and want is None:
+                    continue  # 두 출처 모두 없는 항목(은행의 매출액)
                 same = same and got is not None and want is not None and abs(got - want) <= tolerance
             if same:
                 print(f"    ok   {tag} 추정 {len(estimates)}개 기간, 첫 추정({first[0]}) 매출액·영업이익·EPS = 모바일 API")
@@ -541,31 +556,51 @@ def check_consensus():
                 if now is None or not before or yoy is None:
                     continue
                 yoy_checked += 1
-                if abs((now / before - 1) * 100 - yoy) > 0.02:
+                # 표의 매출액이 소수 한 자리(억원)라 매출이 작으면 계산값이 0.02 넘게 흔들린다.
+                if abs((now / before - 1) * 100 - yoy) > (0.05 / before + now * 0.05 / before ** 2) * 100 + 0.006:
                     yoy_off += 1
                     print(f"    FAIL {tag} {r[0]} YoY {yoy} ≠ {now:,} ÷ {before:,} − 1")
                     problems.append(f"stock_consensus({tag}) YoY 검산 불일치: {r[0]}")
-            # 추이의 기준일 매출액은 표의 그 기간 매출액이다. 0.0은 '값 없음'이라 0으로 나오면 안 된다.
+            # 추이 칸은 원본 값이어야 한다. 원본의 0.0은 '값 없음'이라(1년 전 추정이 없던 기간) '-'여야 하고,
+            # 진짜 작은 값은 숫자로 나와야 한다(롯데케미칼 2027E 1년 전 ROE 0.003% → 0.00). 값이 있는 항목이
+            # 빠져서도 안 된다. 기준일 매출액은 표의 그 기간 매출액과 같아야 한다.
+            frq = 0 if period == "annual" else 1
             trend_checked = trend_off = 0
             for title, trend_header, trend_rows in sections.get("컨센서스 추이") or []:
+                raw = fetch(server._consensus_url(code, 4, frq, yymm=title[:7].replace(".", "")))
+                items = [] if "__error__" in raw else raw.get("JsonData") or []
+                shown_rows = {t[0]: t for t in trend_rows}
+                for item in items:
+                    acc_name, values = item.get("ACC_NM", ""), [item.get(f"VAL{n}") for n in range(1, 6)]
+                    present = [isinstance(v, (int, float)) and v != 0 for v in values]
+                    cells = shown_rows.get(acc_name)
+                    digits = 1 if "(억원)" in acc_name else 0 if "(원)" in acc_name else 2
+                    if cells is None:
+                        wrong = any(present)
+                    else:
+                        wrong = any(cell != "-" if not ok else
+                                    _float(cell) is None or abs(_float(cell) - v) > 0.5 * 10 ** -digits + 1e-9
+                                    for v, ok, cell in zip(values, present, cells[1:]))
+                    if wrong:
+                        trend_off += 1
+                        print(f"    FAIL {tag} 추이 {title[:10]} {acc_name}: 표 {cells and cells[1:]} vs 원본 {values}")
+                        problems.append(f"stock_consensus({tag}) 추이 칸이 원본과 다르다: {title[:10]} {acc_name}")
+                # 기준일 추정치는 위 표의 그 기간 값과 같아야 한다. 한쪽에만 있는 항목(은행의 매출액,
+                # 분기 추이에 없는 BPS)은 건너뛴다.
                 row = by_period.get(title[:7])
-                sales = next((t for t in trend_rows if t[0].startswith("매출액")), None)
-                zeros = [t[0] for t in trend_rows if any(_float(c) == 0 for c in t[1:])]
-                if zeros:
-                    trend_off += 1
-                    print(f"    FAIL {tag} 추이 {title[:10]}에 0으로 나온 칸: {zeros}")
-                    problems.append(f"stock_consensus({tag}) 추이에 값 없음이 0으로 나온다")
-                if row is None or sales is None:
+                if row is None:
                     continue
                 trend_checked += 1
-                if abs(_float(sales[1]) - _float(row[col["매출액"]])) > 1:
-                    trend_off += 1
-                    print(f"    FAIL {tag} 추이 {title[:10]} 기준일 매출액 {sales[1]} ≠ 표 {row[col['매출액']]}")
-                    problems.append(f"stock_consensus({tag}) 추이 기준일 값이 표와 다르다: {title[:10]}")
+                for acc_name, (label, tolerance) in TREND_TO_TABLE.items():
+                    cells = shown_rows.get(acc_name)
+                    a, b = (_float(cells[1]) if cells else None), _float(row[col[label]])
+                    if a is not None and b is not None and abs(a - b) > tolerance:
+                        trend_off += 1
+                        print(f"    FAIL {tag} 추이 {title[:10]} 기준일 {acc_name} {cells[1]} ≠ 표 {row[col[label]]}")
+                        problems.append(f"stock_consensus({tag}) 추이 기준일 값이 표와 다르다: {title[:10]} {acc_name}")
             # 서프라이즈(%) = (실적 − 추정) ÷ |추정| — 추정이 음수여도(SK하이닉스 2023 영업이익) 이 식이다.
             # FnGuide가 주는 %는 음수 추정에서 부호가 뒤집히거나 표의 추정과 안 맞을 때가 있어 도구가
             # 직접 계산하고, 원본과 다른 칸에만 ✎를 단다. 원본 %를 따로 받아 ✎ 판정도 대조한다.
-            frq = 0 if period == "annual" else 1
             shown = {}
             for acc, account in server._CNS_SURPRISE:
                 data = fetch(server._consensus_url(code, 5, frq, acc_cd=acc))
@@ -622,6 +657,36 @@ def check_consensus():
         problems.append(f"stock_consensus 표 없음 {failed} 또는 추정 없음 안내 불일치 {mismatched}")
     else:
         print(f"    ok   {len(STOCKS) + 1}종목 모두 표가 나오고, 추정이 빈 종목에만 '추정치가 없습니다'")
+    # 결산 주기가 6개월인 리츠는 원본 YoY에 직전 결산기 대비가 섞여 있다(한화리츠 2026.04: 원본 3.50%,
+    # 1년 전 대비 7.53%). 도구의 YoY는 1년 전 같은 결산기 대비이거나, 그 결산기가 표에 없으면 비어야 한다.
+    # 한화리츠가 결산 주기를 바꾸거나 상장폐지되면 다른 6개월 결산 리츠(롯데리츠 330590 등)로 바꿀 것.
+    output = server.stock_consensus("451800")
+    main = (consensus_tables(output).get("실적·추정") or [None])[0]
+    if main is None:
+        print(f"    FAIL 한화리츠 표가 없다: {output[:60]}")
+        problems.append("stock_consensus(한화리츠) 표가 없다 — 6개월 결산 YoY 검사를 못 했다")
+    else:
+        _, header, rows = main
+        col = {label: index for index, label in enumerate(header)}
+        months = {int(r[0][:4]) * 12 + int(r[0][5:7]): _float(r[col["매출액"]]) for r in rows}
+        wrong, checked = [], 0
+        for r in rows:
+            now, before = months[int(r[0][:4]) * 12 + int(r[0][5:7])], months.get(int(r[0][:4]) * 12 + int(r[0][5:7]) - 12)
+            cell = r[col["YoY(%)"]].rstrip("✎")
+            if now is None or not before:
+                if cell != "-":
+                    wrong.append(f"{r[0]} {cell}(1년 전 결산기가 없는데 값이 있다)")
+                continue
+            checked += 1
+            if _float(cell) is None or abs(_float(cell) - (now / before - 1) * 100) > \
+                    (0.05 / before + now * 0.05 / before ** 2) * 100 + 0.006:
+                wrong.append(f"{r[0]} {cell} ≠ 1년 전 대비 {(now / before - 1) * 100:.2f}")
+        noted = "결산 주기가 1년이 아닙니다" in output
+        if wrong or not noted or not checked:
+            print(f"    FAIL 한화리츠 YoY {wrong}, 각주 {'있음' if noted else '없음'}, 검산 {checked}행")
+            problems.append("stock_consensus 6개월 결산 YoY가 1년 전 같은 결산기 대비가 아니다")
+        else:
+            print(f"    ok   6개월 결산(한화리츠) YoY = 1년 전 같은 결산기 대비 {checked}행, 나머지는 빈칸 + 각주")
     # 우선주·없는 코드는 WiseReport가 빈 목록을 준다. 우선주 값을 주기 시작하면 안내를 고칠 것.
     for code, label in [("005935", "우선주(005935)"), ("999999", "없는 코드")]:
         ok = "데이터가 없습니다" in server.stock_consensus(code)

@@ -6,7 +6,8 @@
 
 - 공개 인터넷에 배포한 뒤 claude.ai 설정 > 커넥터 > 커스텀 커넥터 추가에서
   URL(예: https://<your-host>/mcp)을 등록하면 모바일/데스크톱/웹에 동기화됩니다.
-- 데이터 출처: 네이버 증권 모바일 API. 개인 용도로만 사용하세요.
+- 데이터 출처: 네이버 증권 모바일 API. 컨센서스는 네이버 증권 종목분석 탭이 쓰는 WiseReport(FnGuide).
+  개인 용도로만 사용하세요.
 - 인증 없음(authless), 읽기 전용(GET 요청만). 외부로 데이터를 보내지 않습니다.
 
 도구:
@@ -16,7 +17,8 @@
   - market_index         : KOSPI/KOSDAQ 지수
   - stock_news           : 종목 관련 최신 뉴스
   - stock_investor_trend : 일별 투자자 수급 (외국인/기관/개인 순매수)
-  - stock_financials     : 실적 추이 (분기/연간, 컨센서스 추정 포함)
+  - stock_financials     : 실적 추이 (분기/연간, 가장 가까운 1개 기간의 컨센서스 추정 포함)
+  - stock_consensus      : 컨센서스 (추정 3개 기간, 추정치 추이, 어닝서프라이즈)
   - stock_compare        : 여러 종목 밸류에이션·수익성 비교 (스크리닝용, 최대 50종목)
 """
 
@@ -36,6 +38,8 @@ NAVER_STOCK_API = "https://m.stock.naver.com/api"
 NAVER_POLLING_API = "https://polling.finance.naver.com/api/realtime/domestic/stock"
 NAVER_CHART_API = "https://api.stock.naver.com/chart/domestic/item"
 NAVER_SEARCH_API = "https://ac.stock.naver.com/ac"
+# 네이버 증권 종목분석 → 컨센서스 탭이 iframe으로 띄우는 WiseReport 페이지(데이터 FnGuide)의 JSON.
+WISEREPORT_CONSENSUS_API = "https://navercomp.wisereport.co.kr/v3/company/ajax/c1050001_data.aspx"
 KST = timezone(timedelta(hours=9))
 USER_AGENT = "Mozilla/5.0 (Macintosh; Apple Silicon) MCP-Korean-Stock/1.0"
 
@@ -423,14 +427,16 @@ _FINANCE_UNITS = {
 }
 
 
+_PERIOD_MAP = {
+    "QUARTER": "quarter", "분기": "quarter", "Q": "quarter",
+    "ANNUAL": "annual", "연간": "annual", "YEAR": "annual", "A": "annual",
+}
+
+
 @mcp.tool()
 def stock_financials(code: str, period: str = "quarter") -> str:
-    """종목의 실적 추이를 조회합니다 (매출액/영업이익/순이익/이익률/ROE/EPS 등). period는 quarter(분기) 또는 annual(연간). 기간 뒤 (E)는 컨센서스 추정치입니다."""
-    period_map = {
-        "QUARTER": "quarter", "분기": "quarter", "Q": "quarter",
-        "ANNUAL": "annual", "연간": "annual", "YEAR": "annual", "A": "annual",
-    }
-    period_code = period_map.get(period.upper(), period.lower())
+    """종목의 실적 추이를 조회합니다 (매출액/영업이익/순이익/이익률/ROE/EPS 등). period는 quarter(분기) 또는 annual(연간). 기간 뒤 (E)는 컨센서스 추정치인데 가장 가까운 1개 기간뿐입니다 — 그 뒤 연도·분기의 추정과 추정치 변화는 stock_consensus로 보세요."""
+    period_code = _PERIOD_MAP.get(period.upper(), period.lower())
     if period_code not in ("quarter", "annual"):
         return f"period는 quarter 또는 annual이어야 합니다 (입력: {period})"
 
@@ -450,7 +456,8 @@ def stock_financials(code: str, period: str = "quarter") -> str:
 
     lines = [
         f"종목 {code} 실적 추이 ({label})",
-        "(E) = 컨센서스 추정치, '-' = 데이터 없음",
+        # 모바일 API는 추정 열을 1개만 준다(2026-09-25, 15종목 모두 연간·분기 각 1개).
+        "(E) = 컨센서스 추정치 — 가장 가까운 1개 기간만 있음, 그 뒤 추정은 stock_consensus / '-' = 데이터 없음",
         "",
         "기간: " + " | ".join(headers),
         "",
@@ -465,6 +472,201 @@ def stock_financials(code: str, period: str = "quarter") -> str:
         lines.append(f"{title}{suffix}: " + " | ".join(values))
 
     return "\n".join(lines)
+
+
+# ── 컨센서스 ─────────────────────────────────────────────────────
+# 모바일 API(finance/annual·quarter)는 추정 열을 가장 가까운 1개 기간만 준다. 네이버 증권 종목분석 →
+# 컨센서스 탭은 WiseReport 페이지를 iframe으로 띄우는데, 그 페이지의 JSON엔 추정 3개 기간이 있다.
+# 같은 컨센서스다 — 2026-09-25 삼성전자 2026E 매출액 7,370,706억·영업이익 3,876,962억·EPS 47,922원이
+# 모바일 API와 일치. 토큰·Referer 없이 받아진다. flag 2 = 실적·추정 표, 1 = 추이를 볼 수 있는 기간,
+# 4 = 추이, 5 = 어닝서프라이즈. 우선주·ETF·상장폐지·없는 코드는 빈 목록이다(우선주에 보통주 값을 주는
+# 모바일 API와 다르다).
+_CNS_COLUMNS = [
+    ("SALES", "매출액"), ("YOY", "YoY(%)"), ("OP", "영업이익"), ("NP", "순이익"), ("EPS", "EPS"),
+    ("BPS", "BPS"), ("PER", "PER"), ("PBR", "PBR"), ("ROE", "ROE(%)"), ("EV", "EV/EBITDA"),
+]
+# 어닝서프라이즈 계정. 순이익은 위 표의 순이익과 같은 기준이다(삼성전자 2025 442,610억 = 지배주주).
+_CNS_SURPRISE = [("121000", "매출액"), ("121500", "영업이익"), ("122700", "순이익")]
+_CNS_SURPRISE_KEYS = ("FY_2", "FY_1", "FY0")  # 실적이 나온 최근 3개 결산기, 오래된 순
+_CNS_TREND_COLUMNS = ("1주전", "1개월전", "3개월전", "1년전")
+
+
+def _consensus_url(code, flag, frq, **params):
+    query = urllib.parse.urlencode({"flag": flag, "cmp_cd": code, "finGubun": "MAIN", "frq": frq, **params})
+    return f"{WISEREPORT_CONSENSUS_API}?{query}"
+
+
+def _cns_number(value, name):
+    """추이 표 숫자 → 컨센서스 탭과 같은 자릿수(억원 소수 한 자리, 원 정수, 배·%·점수 소수 둘째 자리).
+
+    값이 없으면 '-'. 1년 전 추정이 없던 기간은 null이 아니라 0.0으로 온다(삼성전자 2027.06 매출액).
+    """
+    if not isinstance(value, (int, float)) or value == 0:
+        return "-"
+    digits = 1 if "(억원)" in name else 0 if "(원)" in name else 2
+    return f"{value:,.{digits}f}"
+
+
+def _fmt_yyyymmdd(text):
+    text = str(text or "")
+    return f"{text[:4]}-{text[4:6]}-{text[6:8]}" if len(text) == 8 and text.isdigit() else text
+
+
+@mcp.tool()
+def stock_consensus(code: str, period: str = "annual") -> str:
+    """종목의 애널리스트 컨센서스(FnGuide)를 조회합니다 — 네이버 증권 종목분석 → 컨센서스 탭과 같은 데이터.
+    period는 annual(연간, 기본) 또는 quarter(분기).
+    ① 실적·추정 표: 최근 실적 4개 기간 + 추정 3개 기간(연간이면 예: 2026·2027·2028년) — 매출액·YoY·
+       영업이익·순이익·EPS·BPS·PER·PBR·ROE·EV/EBITDA
+    ② 컨센서스 추이: 추정 기간마다 기준일·1주·1개월·3개월·1년 전의 추정치(상향·하향 확인)
+    ③ 어닝서프라이즈: 최근 3개 결산기의 실적과 발표 전 추정치(매출액·영업이익·순이익)
+    stock_financials의 추정은 가장 가까운 1개 기간뿐이라 그 뒤 추정은 이 도구로 보세요.
+    목표주가·투자의견 평균은 stock_detail에 있습니다."""
+    period_code = _PERIOD_MAP.get(period.upper(), period.lower())
+    if period_code not in ("quarter", "annual"):
+        return f"period는 annual 또는 quarter여야 합니다 (입력: {period})"
+    frq = 0 if period_code == "annual" else 1
+
+    table = _fetch(_consensus_url(code, 2, frq))
+    if not isinstance(table, dict) or "error" in table:
+        return f"종목코드 {code} 컨센서스 조회 실패"
+    rows = table.get("JsonData") or []
+    if not rows:
+        return (f"종목 {code} 컨센서스 데이터가 없습니다 — 우선주·ETF·상장폐지·없는 코드는 제공되지 않습니다"
+                " (우선주는 보통주 코드로 조회하세요)")
+
+    # 추이는 실적이 나온 기간 뒤만 본다. 기간 목록엔 표보다 먼 추정이 있을 때가 있다(삼성전자 분기 표는
+    # 2027.03까지, 추이는 2027.06까지).
+    last_actual = max((r.get("YYMM", "")[:7].replace(".", "") for r in rows if "(A)" in r.get("YYMM", "")),
+                      default="")
+    listed = _fetch(_consensus_url(code, 1, frq))
+    listed_ok = isinstance(listed, dict) and "error" not in listed
+    periods = [p["YYMM"] for p in (listed.get("JsonData") or []) if isinstance(p, dict)
+               and p.get("YYMM") and p["YYMM"] > last_actual] if listed_ok else []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        trend_jobs = [pool.submit(_fetch, _consensus_url(code, 4, frq, yymm=p)) for p in periods]
+        surprise_jobs = [pool.submit(_fetch, _consensus_url(code, 5, frq, acc_cd=acc)) for acc, _ in _CNS_SURPRISE]
+    trends = [job.result() for job in trend_jobs]
+    surprises = [job.result() for job in surprise_jobs]
+
+    label = "연간" if frq == 0 else "분기"
+    dates = [t["JsonData"][0].get("DT") for t in trends if isinstance(t, dict) and t.get("JsonData")]
+    lines = [
+        f"종목 {code} 컨센서스 ({label}) — FnGuide" + (f", 기준일 {_fmt_yyyymmdd(dates[0])}" if dates else ""),
+        "출처: 네이버 증권 종목분석 → 컨센서스 (WiseReport). (A) = 실적, (E) = 컨센서스 추정치, '-' = 값 없음",
+    ]
+    bases = sorted({r.get("MAIN") for r in rows if r.get("MAIN")})
+    if len(bases) == 1:
+        lines.append(f"재무 기준: {bases[0]}")
+
+    lines += ["", "[실적·추정]", "| 기간 | " + " | ".join(n for _, n in _CNS_COLUMNS) + " |",
+              "|" + "------|" * (len(_CNS_COLUMNS) + 1)]
+    for r in rows:
+        # 재무 기준이 기간마다 다르면(별도 → 연결 전환 등) 기간 옆에 적는다.
+        basis = f" {r['MAIN']}" if len(bases) > 1 and r.get("MAIN") else ""
+        lines.append(f"| {r.get('YYMM', '')}{basis} | " + " | ".join(str(r.get(k) or "-") for k, _ in _CNS_COLUMNS) + " |")
+    estimates = [r for r in rows if "(E)" in r.get("YYMM", "")]
+    if not any(r.get(k) for r in estimates for k, _ in _CNS_COLUMNS):
+        lines += ["", "현재 컨센서스 추정치가 없습니다."]
+
+    trend_lines = []
+    for p, t in zip(periods, trends):
+        name = f"{p[:4]}.{p[4:]}(E)"
+        items = t.get("JsonData") if isinstance(t, dict) and "error" not in t else None
+        if items is None:
+            trend_lines += ["", f"{name} 조회 실패"]
+            continue
+        if all(_cns_number(i.get("VAL1"), "") == "-" for i in items):
+            continue  # 기준일 추정치가 없는 기간
+        trend_lines += ["", f"{name} — 기준일 {_fmt_yyyymmdd(items[0].get('DT'))}",
+                        f"| 항목 | {_fmt_yyyymmdd(items[0].get('DT'))} | " + " | ".join(_CNS_TREND_COLUMNS) + " |",
+                        "|" + "------|" * (len(_CNS_TREND_COLUMNS) + 2)]
+        for i in items:
+            acc = i.get("ACC_NM", "")
+            cells = [_cns_number(i.get(f"VAL{n}"), acc) for n in range(1, 6)]
+            if any(c != "-" for c in cells):  # 분기 추이의 ROE처럼 전부 빈 항목은 뺀다
+                trend_lines.append(f"| {acc} | " + " | ".join(cells) + " |")
+    if not listed_ok:
+        trend_lines += ["", "추이 기간 목록 조회 실패"]
+    if trend_lines:
+        lines += ["", "[컨센서스 추이] 기준일 추정치와 그 전 시점의 추정치 — 상향·하향 확인용"] + trend_lines
+
+    parsed, failed = [], []
+    for (_, account), s in zip(_CNS_SURPRISE, surprises):
+        data = s.get("tableData") if isinstance(s, dict) and "error" not in s else None
+        if not isinstance(data, dict):
+            failed.append(account)
+            continue
+        found = data.get("tableData") or []
+        parsed.append((account, (data.get("tableHeaderData") or [{}])[0],
+                       next((x for x in found if "(A)" in str(x.get("QTR"))), {}),
+                       {x.get("QTR"): x for x in found if "(E)" in str(x.get("QTR"))}))
+    # 발표직전·3개월전… (분기는 발표직전·1개월전…) — 응답 순서대로 열을 만들고 계정마다 같은 이름으로 채운다.
+    heads = next((list(e) for *_, e in parsed if e), [])
+    # 서프라이즈 %는 표의 실적·추정으로 직접 계산한다. FnGuide가 주는 %는 세 가지로 어긋난다(2026-09-25,
+    # 45종목 2,951칸): ① 추정이 음수인 칸은 발표직전 외 열이 실적 ÷ 추정 − 1이라 부호가 반대다(150칸 —
+    # LG에너지솔루션 2025/12 분기 영업이익 적자 −214 → −1,220이 +469%) ② 같은 칸의 발표직전 열은
+    # (실적 − 추정) ÷ |추정|이다(56칸) ③ 발표직전 %가 표의 추정과 안 맞는다(9칸 — 삼성바이오로직스 2025
+    # 매출액 실적 45,570 > 추정 44,363인데 −9.44%). 화면과 다른 칸은 ✎로 표시하고 ③은 화면 값을 남긴다.
+    surprise_lines, differ, flipped = [], [], False
+    for key in _CNS_SURPRISE_KEYS:
+        for account, header, actual, est in parsed:
+            if not any(e.get(key) for e in est.values()):
+                continue  # 발표 전 추정이 없던 결산기는 비교할 게 없다
+            period_name = header.get(f"CNS_{key}", key)
+            date = actual.get(f"{key}_S")
+            real = _num(actual.get(key) or "-")
+            cells = [(actual.get(key) or "-") + (f" ({date})" if actual.get(key) and date else "")]
+            for head in heads:
+                e = est.get(head) or {}
+                value, shown = e.get(key), e.get(f"{key}_S")
+                guess = _num(value or "-")
+                if real is None or not guess:
+                    cells.append(value or "-")
+                    continue
+                ratio = (real - guess) / abs(guess) * 100
+                # 표의 값이 소수 한 자리(억원)라 생기는 오차 + %의 반올림.
+                tolerance = (0.05 / abs(guess) + abs(real) * 0.05 / guess ** 2) * 100 + 0.006
+                mark = ""
+                if isinstance(shown, (int, float)) and abs(shown - ratio) > tolerance:
+                    mark = "✎"
+                    if abs(shown + ratio) <= tolerance:
+                        flipped = True
+                    else:  # 부호만 반대인 게 아니면 화면 값을 적어 둔다
+                        differ.append(f"{period_name} {account} {head} {shown:+.2f}%")
+                cells.append(f"{value} ({ratio:+.2f}%{mark})")
+            surprise_lines.append(f"| {period_name} | {account} | " + " | ".join(cells) + " |")
+    if surprise_lines:
+        lines += ["", "[어닝서프라이즈] 실적과 발표 전 추정치 — 괄호는 서프라이즈(%) = (실적 − 추정) ÷ |추정|",
+                  "| 결산기 | 항목 | 실적 (발표일) | " + " | ".join(heads) + " |",
+                  "|" + "------|" * (len(heads) + 3)] + surprise_lines
+    if failed:
+        lines += ["", f"어닝서프라이즈 조회 실패: {', '.join(failed)}"]
+
+    notes = [
+        "단위 — 매출액·영업이익·순이익: 억원, EPS·BPS: 원, PER·PBR·EV/EBITDA: 배, YoY·ROE: %. "
+        "IFRS 연결 회사의 순이익·BPS·ROE는 지배주주 기준입니다.",
+    ]
+    # (E)의 PER은 기준일 정규장 종가 ÷ EPS(E)다 — 2026-09-23 삼성전자 285,500 ÷ 47,922 = 5.96(애프터마켓
+    # 종가 286,500이면 5.98). (A)는 결산기 말 종가다 — 2024년 53,200 ÷ 4,950 = 10.75, 2023년 78,500 ÷ 2,131 = 36.84.
+    if frq == 0:
+        notes.append("PER·PBR — (A)는 그 결산기 말 주가, (E)는 기준일 정규장 종가 기준입니다. "
+                     "현재가 기준 선행PER은 stock_compare를 쓰세요.")
+    else:
+        # 분기 값은 분기 하나로 계산한다 — 2026.09(E) PER 20.97 = 285,500 ÷ 분기 EPS 13,616,
+        # 2026.06(A) ROE 13.72% = 분기 순이익 712,695억 ÷ 평균 지배주주 자본 5,195,148억.
+        notes.append("분기의 PER·ROE·EV/EBITDA는 그 분기 실적 하나로 계산한 값이라(연환산 아님) 연간 값과 "
+                     "비교하면 안 됩니다. (E)의 PER은 기준일 정규장 종가 기준입니다.")
+    # 삼성전자 2025 영업이익: 서프라이즈 실적 435,300억(2026/01/08 잠정 발표) vs 위 표 436,010.5억(확정).
+    notes.append("어닝서프라이즈의 실적은 발표일 당시 값이라(잠정실적을 내는 회사는 잠정치) 위 표의 확정치와 "
+                 "다를 수 있습니다.")
+    if flipped or differ:
+        notes.append("✎ = 네이버 화면과 서프라이즈 %가 다른 칸."
+                     + (" 추정이 음수(적자)인 칸의 발표직전 외 열은 화면이 실적 ÷ 추정 − 1로 계산해 부호가 반대입니다."
+                        if flipped else "")
+                     + (f" 발표직전 %가 표의 추정과 맞지 않는 칸의 화면 값: {', '.join(differ)}" if differ else ""))
+    notes.append("목표주가·투자의견 평균은 stock_detail에 있습니다.")
+    return "\n".join(lines) + "\n\n" + "\n".join(f"> {n}" for n in notes)
 
 
 # ── 멀티 종목 비교 ────────────────────────────────────────────────

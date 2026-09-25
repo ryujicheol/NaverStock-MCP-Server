@@ -450,6 +450,186 @@ def check_labels_2026_09_24():
         problems.append(f"정규장 마감 시각 판정이 평일에 15:30이 아니다: {ends}")
 
 
+def consensus_tables(text):
+    """stock_consensus 출력 → {섹션: [(표 위 제목 줄, 머리행, 행들)]}."""
+    sections, section, title, table = {}, None, "", None
+    for line in text.split("\n"):
+        if line.startswith("[") and "]" in line:
+            section, title, table = line[1:line.index("]")], "", None
+            sections[section] = []
+        elif line.startswith("|"):
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if set("".join(cells)) <= {"-"}:
+                continue  # 구분선
+            if table is None:
+                table = (title, cells, [])
+                sections.setdefault(section, []).append(table)
+            else:
+                table[2].append(cells)
+        else:
+            table = None
+            if line.strip():
+                title = line.strip()
+    return sections
+
+
+def _float(text):
+    try:
+        return float(str(text).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def check_consensus():
+    print("\n" + "=" * 62)
+    print("[9] stock_consensus — 추정 기간 전부, 모바일 API와 같은 컨센서스, 산술 검산")
+    print("=" * 62)
+    # 전제: 모바일 API는 추정 열을 1개만 준다(2026-09-25) — stock_financials가 stock_consensus를
+    # 안내하는 이유다. 더 주기 시작하면 그 안내가 거짓이 된다.
+    many = []
+    for code, name in STOCKS:
+        for period in ("annual", "quarter"):
+            data = fetch(f"https://m.stock.naver.com/api/stock/{code}/finance/{period}")
+            titles = [] if "__error__" in data else (data.get("financeInfo") or {}).get("trTitleList") or []
+            estimates = [t.get("title") for t in titles if t.get("isConsensus") == "Y"]
+            if len(estimates) > 1:
+                many.append(f"{name} {period} {estimates}")
+    if many:
+        print(f"    FAIL 모바일 API가 추정 열을 2개 이상 준다 — stock_financials 안내를 고칠 것: {many}")
+        problems.append("모바일 API 추정 열이 1개가 아니다 — stock_financials 안내 수정 필요")
+    else:
+        print(f"    ok   전제 — 모바일 API 추정 열은 연간·분기 각 1개 이하 ({len(STOCKS)}종목)")
+
+    for code, name in [("005930", "삼성전자"), ("000660", "SK하이닉스")]:
+        for period in ("annual", "quarter"):
+            tag = f"{name} {period}"
+            sections = consensus_tables(server.stock_consensus(code, period))
+            main = (sections.get("실적·추정") or [None])[0]
+            if main is None:
+                print(f"    FAIL {tag} 실적·추정 표가 없다")
+                problems.append(f"stock_consensus({tag}) 표가 없다")
+                continue
+            _, header, rows = main
+            col = {label: index for index, label in enumerate(header)}
+            by_period = {r[0][:7]: r for r in rows}
+            estimates = [r for r in rows if "(E)" in r[0] and r[col["매출액"]] != "-"]
+            # 모바일 API는 추정이 1개 기간뿐이었다 — 이 도구를 만든 이유다.
+            if len(estimates) < 2:
+                print(f"    FAIL {tag} 추정 기간이 {len(estimates)}개뿐이다")
+                problems.append(f"stock_consensus({tag}) 추정 기간이 2개 미만")
+            # 첫 추정은 모바일 API의 추정 열과 같은 컨센서스여야 한다(억원은 반올림 차 1까지).
+            mobile = fetch(f"https://m.stock.naver.com/api/stock/{code}/finance/{period}")
+            info = {} if "__error__" in mobile else mobile.get("financeInfo") or {}
+            head = next((t for t in info.get("trTitleList") or [] if t.get("isConsensus") == "Y"), None)
+            values = {r.get("title"): (r.get("columns") or {}).get(head.get("key"), {}).get("value")
+                      for r in info.get("rowList") or []} if head else {}
+            first = estimates[0] if estimates else None
+            same = first is not None and head is not None and first[0][:7] == head.get("title", "")[:7]
+            for label, mobile_label, tolerance in [("매출액", "매출액", 1), ("영업이익", "영업이익", 1), ("EPS", "EPS", 0)]:
+                got, want = _float(first[col[label]]) if first else None, _float(values.get(mobile_label))
+                same = same and got is not None and want is not None and abs(got - want) <= tolerance
+            if same:
+                print(f"    ok   {tag} 추정 {len(estimates)}개 기간, 첫 추정({first[0]}) 매출액·영업이익·EPS = 모바일 API")
+            else:
+                print(f"    FAIL {tag} 첫 추정이 모바일 API와 다르다: {first} vs {head and head.get('title')} {values}")
+                problems.append(f"stock_consensus({tag}) 첫 추정이 모바일 API 추정 열과 다르다")
+            # YoY = 1년 전 같은 달 대비 매출액 증가율.
+            yoy_checked = yoy_off = 0
+            for r in rows:
+                prev = by_period.get(f"{int(r[0][:4]) - 1}{r[0][4:7]}")
+                now, before, yoy = _float(r[col["매출액"]]), prev and _float(prev[col["매출액"]]), _float(r[col["YoY(%)"]])
+                if now is None or not before or yoy is None:
+                    continue
+                yoy_checked += 1
+                if abs((now / before - 1) * 100 - yoy) > 0.02:
+                    yoy_off += 1
+                    print(f"    FAIL {tag} {r[0]} YoY {yoy} ≠ {now:,} ÷ {before:,} − 1")
+                    problems.append(f"stock_consensus({tag}) YoY 검산 불일치: {r[0]}")
+            # 추이의 기준일 매출액은 표의 그 기간 매출액이다. 0.0은 '값 없음'이라 0으로 나오면 안 된다.
+            trend_checked = trend_off = 0
+            for title, trend_header, trend_rows in sections.get("컨센서스 추이") or []:
+                row = by_period.get(title[:7])
+                sales = next((t for t in trend_rows if t[0].startswith("매출액")), None)
+                zeros = [t[0] for t in trend_rows if any(_float(c) == 0 for c in t[1:])]
+                if zeros:
+                    trend_off += 1
+                    print(f"    FAIL {tag} 추이 {title[:10]}에 0으로 나온 칸: {zeros}")
+                    problems.append(f"stock_consensus({tag}) 추이에 값 없음이 0으로 나온다")
+                if row is None or sales is None:
+                    continue
+                trend_checked += 1
+                if abs(_float(sales[1]) - _float(row[col["매출액"]])) > 1:
+                    trend_off += 1
+                    print(f"    FAIL {tag} 추이 {title[:10]} 기준일 매출액 {sales[1]} ≠ 표 {row[col['매출액']]}")
+                    problems.append(f"stock_consensus({tag}) 추이 기준일 값이 표와 다르다: {title[:10]}")
+            # 서프라이즈(%) = (실적 − 추정) ÷ |추정| — 추정이 음수여도(SK하이닉스 2023 영업이익) 이 식이다.
+            # FnGuide가 주는 %는 음수 추정에서 부호가 뒤집히거나 표의 추정과 안 맞을 때가 있어 도구가
+            # 직접 계산하고, 원본과 다른 칸에만 ✎를 단다. 원본 %를 따로 받아 ✎ 판정도 대조한다.
+            frq = 0 if period == "annual" else 1
+            shown = {}
+            for acc, account in server._CNS_SURPRISE:
+                data = fetch(server._consensus_url(code, 5, frq, acc_cd=acc))
+                found = {} if "__error__" in data else data.get("tableData") or {}
+                header_row = (found.get("tableHeaderData") or [{}])[0]
+                for row in found.get("tableData") or []:
+                    for key in server._CNS_SURPRISE_KEYS:
+                        shown[(header_row.get(f"CNS_{key}"), account, row.get("QTR"))] = row.get(f"{key}_S")
+            surprise_checked = surprise_off = marks = 0
+            for _, surprise_header, surprise_rows in sections.get("어닝서프라이즈") or []:
+                for r in surprise_rows:
+                    actual = _float(r[2].split(" (")[0])
+                    for head, cell in zip(surprise_header[3:], r[3:]):
+                        m = re.match(r"^(-?[\d,]+(?:\.\d+)?) \(([+-]\d+\.\d+)%(✎?)\)$", cell)
+                        if not m or actual is None:
+                            continue
+                        estimate, ratio, marked = _float(m.group(1)), float(m.group(2)), bool(m.group(3))
+                        surprise_checked += 1
+                        marks += marked
+                        computed = (actual - estimate) / abs(estimate) * 100
+                        if abs(computed - ratio) > 0.006:
+                            surprise_off += 1
+                            print(f"    FAIL {tag} 서프라이즈 {r[0]} {r[1]}: {cell} vs 실적 {r[2]}")
+                            problems.append(f"stock_consensus({tag}) 서프라이즈 % 검산 불일치: {r[0]} {r[1]}")
+                        original = shown.get((r[0], r[1], head))
+                        tolerance = (0.05 / abs(estimate) + abs(actual) * 0.05 / estimate ** 2) * 100 + 0.006
+                        should = isinstance(original, (int, float)) and abs(original - computed) > tolerance
+                        if marked != should:
+                            surprise_off += 1
+                            print(f"    FAIL {tag} ✎ 판정 {r[0]} {r[1]} {head}: {cell}, 화면 {original}")
+                            problems.append(f"stock_consensus({tag}) ✎ 판정이 어긋났다: {r[0]} {r[1]} {head}")
+            if not (yoy_off or trend_off or surprise_off):
+                print(f"    ok   {tag} 검산 — YoY {yoy_checked}행, 추이 기준일 {trend_checked}기간, "
+                      f"서프라이즈 {surprise_checked}칸 (화면과 달라 ✎ {marks}칸)")
+            if not surprise_checked or not trend_checked:
+                print(f"    FAIL {tag} 검산할 추이·서프라이즈가 없다 (추이 {trend_checked}, 서프라이즈 {surprise_checked})")
+                problems.append(f"stock_consensus({tag}) 추이 또는 서프라이즈가 비었다")
+
+    # 추정이 없는 종목(지금은 에스티아이·한화리츠·엘브이엠씨홀딩스)은 그렇다고 말해야 하고, 추정이 있는
+    # 종목엔 그 말이 없어야 한다. 종목의 커버리지가 바뀌어도 이 검사는 스스로 맞다.
+    mismatched, failed = [], []
+    for code, name in STOCKS + [("039440", "에스티아이")]:
+        output = server.stock_consensus(code)
+        main = (consensus_tables(output).get("실적·추정") or [None])[0]
+        if main is None:
+            failed.append(name)
+            continue
+        estimates = [r for r in main[2] if "(E)" in r[0]]
+        blank = all(c == "-" for r in estimates for c in r[1:])
+        if blank != ("현재 컨센서스 추정치가 없습니다" in output):
+            mismatched.append(name)
+    if failed or mismatched:
+        print(f"    FAIL 표가 없음 {failed} / 추정 없음 안내 불일치 {mismatched}")
+        problems.append(f"stock_consensus 표 없음 {failed} 또는 추정 없음 안내 불일치 {mismatched}")
+    else:
+        print(f"    ok   {len(STOCKS) + 1}종목 모두 표가 나오고, 추정이 빈 종목에만 '추정치가 없습니다'")
+    # 우선주·없는 코드는 WiseReport가 빈 목록을 준다. 우선주 값을 주기 시작하면 안내를 고칠 것.
+    for code, label in [("005935", "우선주(005935)"), ("999999", "없는 코드")]:
+        ok = "데이터가 없습니다" in server.stock_consensus(code)
+        print(f"    {'ok  ' if ok else 'FAIL'} {label} → 데이터 없음 안내")
+        if not ok:
+            problems.append(f"stock_consensus {label} 안내가 어긋났다")
+
+
 def main():
     check_referenced_fields()
     check_detail_labels()
@@ -459,6 +639,7 @@ def main():
     check_edges()
     check_regular_close()
     check_labels_2026_09_24()
+    check_consensus()
     print("\n" + "=" * 62)
     if problems:
         print(f"문제 {len(problems)}건")

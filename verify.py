@@ -568,6 +568,19 @@ def skip_if_external(label, output):
     return True
 
 
+def call_consensus(label, *args):
+    """stock_consensus를 부른다. 외부 원인이 아닌 조회 실패(빈 응답 등)가 섞이면 한 번 더 부른다 — 두 번 다
+    실패해야 FAIL이 된다. 2026-09-25 CI에서 SK하이닉스 연간 첫 호출만 표가 없었고, 같은 실행의 다음 호출은
+    정상이었다(타임아웃이 아니라 경고로 건너뛰지도 못했다). 주소가 바뀐 404 같은 문제는 다시 불러도 실패한다.
+    """
+    output = server.stock_consensus(*args)
+    if "조회 실패" in output and not external_failure(output):
+        reason = next((line for line in output.splitlines() if "실패" in line), "")
+        print(f"    warn {label} — 조회 실패가 섞여 한 번 더 불렀다 ({reason[:70]})")
+        output = server.stock_consensus(*args)
+    return output
+
+
 # 추이 항목 → 실적·추정 표의 열, 허용 오차(억원은 표가 소수 한 자리, 추이가 정수 반올림)
 TREND_TO_TABLE = {
     "매출액(억원)": ("매출액", 1), "영업이익(억원)": ("영업이익", 1), "순이익(억원)": ("순이익", 1),
@@ -599,7 +612,7 @@ def check_consensus():
     for code, name in [("005930", "삼성전자"), ("000660", "SK하이닉스"), ("011170", "롯데케미칼")]:
         for period in ("annual", "quarter"):
             tag = f"{name} {period}"
-            output = server.stock_consensus(code, period)
+            output = call_consensus(tag, code, period)
             if skip_if_external(tag, output):
                 continue
             sections = consensus_tables(output)
@@ -609,7 +622,7 @@ def check_consensus():
                 problems.append(f"stock_consensus({tag}) 분기 각주가 어긋났다")
             main = (sections.get("실적·추정") or [None])[0]
             if main is None:
-                print(f"    FAIL {tag} 실적·추정 표가 없다")
+                print(f"    FAIL {tag} 실적·추정 표가 없다: {output.splitlines()[0][:90]}")
                 problems.append(f"stock_consensus({tag}) 표가 없다")
                 continue
             _, header, rows = main
@@ -789,7 +802,7 @@ def check_consensus():
     # 종목엔 그 말이 없어야 한다. 종목의 커버리지가 바뀌어도 이 검사는 스스로 맞다.
     mismatched, failed, checked_names = [], [], 0
     for code, name in STOCKS + [("039440", "에스티아이"), ("310210", "보로노이")]:
-        output = server.stock_consensus(code)
+        output = call_consensus(name, code)
         if skip_if_external(f"{name} 추정 없음 안내", output):
             continue
         checked_names += 1
@@ -820,7 +833,7 @@ def check_consensus():
     # 결산 주기가 6개월인 리츠는 원본 YoY에 직전 결산기 대비가 섞여 있다(한화리츠 2026.04: 원본 3.50%,
     # 1년 전 대비 7.53%). 도구의 YoY는 1년 전 같은 결산기 대비이거나, 그 결산기가 표에 없으면 비어야 한다.
     # 한화리츠가 결산 주기를 바꾸거나 상장폐지되면 다른 6개월 결산 리츠(롯데리츠 330590 등)로 바꿀 것.
-    output = server.stock_consensus("451800")
+    output = call_consensus("한화리츠", "451800")
     main = (consensus_tables(output).get("실적·추정") or [None])[0]
     if skip_if_external("한화리츠 6개월 결산 YoY", output):
         pass
@@ -851,7 +864,7 @@ def check_consensus():
             print(f"    ok   6개월 결산(한화리츠) YoY = 1년 전 같은 결산기 대비 {checked}행, 나머지는 빈칸 + 각주")
     # 우선주·없는 코드는 WiseReport가 빈 목록을 준다. 우선주 값을 주기 시작하면 안내를 고칠 것.
     for code, label in [("005935", "우선주(005935)"), ("999999", "없는 코드")]:
-        output = server.stock_consensus(code)
+        output = call_consensus(label, code)
         if skip_if_external(label, output):
             continue
         ok = "데이터가 없습니다" in output

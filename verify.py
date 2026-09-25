@@ -230,8 +230,9 @@ def check_compare_table():
 
     # 선행PER은 표에 찍힌 현재가 ÷ EPS(E)여야 한다. 실적표의 PER(E)는 배치 시점 값(대개
     # 전일 종가 기준)이라 옮겨 쓰면 틀린다 — 2026-09-23에 `*` 행에서 실제로 났던 버그다.
-    # 적자면 음수 PER 대신 '적자'여야 한다. 음수 PER은 "10배 이하" 필터를 통과하고,
-    # 크기 순서도 뜻이 없다(적자가 클수록 0에 가깝다).
+    # 적자면 부호만 붙은 음수 PER 대신 '적자(현재가 ÷ EPS)'여야 한다(사용자 결정 2026-09-25, 괄호는
+    # 계산값 보존용). 음수 PER은 "10배 이하" 필터를 통과하고, 크기 순서도 뜻이 없다(적자가 클수록 0에
+    # 가깝다). 숫자가 아니므로 `*`(추정EPS 보완)도 붙지 않는다.
     col = {label: index for index, label in enumerate(header)}
     checked = stars = losses = off = 0
     for r in rows:
@@ -241,12 +242,13 @@ def check_compare_table():
         per = r[col["선행PER"]]
         if eps is not None and eps < 0:
             losses += 1
-            if per != "적자":
+            want = f"적자({price / eps:.2f})" if price else "적자"
+            if per != want:
                 off += 1
-                print(f"    FAIL 선행PER {r[0]}: 적자 추정(EPS(E) {eps:,})인데 {per}")
-                problems.append(f"stock_compare 적자 추정인데 선행PER이 '적자'가 아니다: {r[0]}")
+                print(f"    FAIL 선행PER {r[0]}: 적자 추정(EPS(E) {eps:,})인데 {per} (기대 {want})")
+                problems.append(f"stock_compare 적자 추정인데 선행PER이 '{want}'가 아니다: {r[0]}")
             continue
-        if not price or not eps or per.rstrip("*") in ("-", "적자"):
+        if not price or not eps or per.rstrip("*") == "-" or per.startswith("적자"):
             continue
         checked += 1
         stars += per.endswith("*")
@@ -256,12 +258,12 @@ def check_compare_table():
             problems.append(f"stock_compare 선행PER이 현재가 ÷ EPS(E)와 다르다: {r[0]}")
     if not off:
         print(f"    ok   선행PER = 현재가 ÷ EPS(E) — {checked}행 검산 일치 (`*` 보완 {stars}행 포함), "
-              f"적자 추정 {losses}행은 '적자'")
+              f"적자 추정 {losses}행은 '적자(현재가 ÷ EPS(E))'")
 
     # 시총·PER·PBR도 그 행의 현재가로 계산돼야 한다. 종목 상세의 값을 옮기면 요청 시점이 달라
     # 현재가와 틱이 어긋난다 — 2026-09-23 애프터마켓 중 삼성전자가 같은 현재가 285,500원에 시총
     # 1,666조/1,669조로 갈렸다. 표에 EPS·BPS·주식수가 없으니 따로 받아 대조한다(주식수 = 시세
-    # 응답의 시총 ÷ 현재가). 후행 PER은 적자면 '적자'여야 한다.
+    # 응답의 시총 ÷ 현재가). 후행 PER은 적자면 '적자(현재가 ÷ EPS)'여야 한다.
     valid = [r for r in rows if len(r) == len(header) and not r[0].endswith("조회 실패")]
     codes = [r[0].rsplit("(", 1)[-1].rstrip(")") for r in valid]
     polled = fetch(URLS["polling"].format(code=",".join(codes)))
@@ -278,7 +280,7 @@ def check_compare_table():
         expected = {}
         if eps is not None and eps < 0:
             trailing_losses += 1
-            expected["PER"] = "적자"
+            expected["PER"] = f"적자({price / eps:.2f})" if price else "적자"
         elif price and eps:
             expected["PER"] = price / eps
         if price and bps and bps > 0:
@@ -301,7 +303,8 @@ def check_compare_table():
                 print(f"    FAIL {label} {r[0]}: 표 {got} ≠ 그 행의 현재가 {r[col['현재가']]} 기준 {want}")
                 problems.append(f"stock_compare {label}이 그 행의 현재가 기준이 아니다: {r[0]}")
     if not derived_off:
-        print(f"    ok   시총·PER·PBR = 그 행의 현재가 기준 — {cells}칸 검산 일치, 후행 적자 {trailing_losses}행은 '적자'")
+        print(f"    ok   시총·PER·PBR = 그 행의 현재가 기준 — {cells}칸 검산 일치, "
+              f"후행 적자 {trailing_losses}행은 '적자(현재가 ÷ EPS)'")
 
 
 def check_compare_sort():
@@ -399,6 +402,32 @@ def check_edges():
     if not lower:
         problems.append("소문자 종목코드가 조회 실패로 나온다")
 
+    # 적자 추정인데 종목 상세에 추정EPS가 없어 실적표로 보완한 행 — 선행PER이 '적자(…)'라 숫자가 아니므로
+    # `*`는 붙지 않아야 한다(옛 조건 `not in ("-", "적자")`는 괄호가 붙자 `*`를 달았다). 지금 살아 있는
+    # 종목엔 이 경우가 없어(2026-09-25) 가짜 응답으로 본다.
+    saved_fetch = server._fetch
+
+    def fake_fetch(url):
+        if url.endswith("/integration"):
+            return {"totalInfos": [{"key": "EPS", "value": "-1,000원"}, {"key": "BPS", "value": "10,000원"}]}
+        if url.endswith("/finance/annual"):
+            return {"financeInfo": {
+                "trTitleList": [{"key": "202512", "title": "2025.12.", "isConsensus": "N"},
+                                {"key": "202612", "title": "2026.12.", "isConsensus": "Y"}],
+                "rowList": [{"title": "EPS", "columns": {"202612": {"value": "-500"}}}]}}
+        return saved_fetch(url)
+
+    server._fetch = fake_fetch
+    try:
+        row = server._compare_one("000000", {"closePrice": "10,000", "stockName": "가짜"})
+    finally:
+        server._fetch = saved_fetch
+    ok = (row["fwd_per"], row["per"], row["fallback"]) == ("적자(-20.00)", "적자(-10.00)", False)
+    print(f"    {'ok  ' if ok else 'FAIL'} 적자 + 추정EPS 보완 행 → 선행PER {row['fwd_per']}, PER {row['per']}, "
+          f"`*` {'없음' if not row['fallback'] else '붙음'}")
+    if not ok:
+        problems.append("stock_compare 적자 보완 행의 표시가 어긋났다(`*` 또는 적자 괄호)")
+
     # 우선주는 EPS·BPS가 보통주 값이라 배수가 낮게 나온다 — 행에 †와 주석이 붙어야 한다
     # (2026-09-23 리뷰). 주석의 전제(보통주 값과 같다)도 함께 본다. 네이버가 우선주 자체 EPS를
     # 주기 시작하면 주석이 거짓이 된다.
@@ -480,6 +509,37 @@ def _float(text):
         return None
 
 
+def _plain(cell):
+    """'적자(-14.34)' → '-14.34'. 그 밖의 칸은 그대로."""
+    m = re.fullmatch(r"적자\((.*)\)", str(cell))
+    return m.group(1) if m else cell
+
+
+def loss_label_problems(sections):
+    """적자 PER 표시(사용자 결정 2026-09-25: '적자(원래 값)')가 어긋난 칸.
+
+    EPS가 음수면 PER은 '적자'로 시작해야 하고, 흑자면 아니어야 한다. 부호만 붙은 음수 PER이 남으면
+    안 된다 — 음수 PER은 크기가 적자 규모에 반비례해 거꾸로 읽힌다(롯데케미칼 2024 EPS −39,988 → −1.50).
+    """
+    pairs = []
+    main = (sections.get("실적·추정") or [None])[0]
+    if main:
+        _, header, rows = main
+        col = {label: index for index, label in enumerate(header)}
+        pairs += [(r[0], r[col["EPS"]], r[col["PER"]]) for r in rows if len(r) == len(header)]
+    for title, header, rows in sections.get("컨센서스 추이") or []:
+        eps = next((r for r in rows if r[0].startswith("EPS")), None)
+        per = next((r for r in rows if r[0].startswith("PER")), None)
+        if eps and per:
+            pairs += [(f"{title[:10]} {header[n]}", eps[n], per[n]) for n in range(1, min(len(eps), len(per)))]
+    issues = []
+    for where, eps_cell, per_cell in pairs:
+        eps_value, loss = _float(eps_cell), per_cell.startswith("적자")
+        if (_float(per_cell) or 0) < 0 or (eps_value is not None and eps_value != 0 and (eps_value < 0) != loss):
+            issues.append(f"{where}: EPS {eps_cell}, PER {per_cell}")
+    return issues
+
+
 # WiseReport가 응답을 멈추거나 막는 실패 — GitHub 러너 IP에서 가끔 난다(2026-09-25 CI 5회 중 2회, 전부
 # 타임아웃. 로컬·Render에선 재현 안 됨). 우리 코드 문제가 아니라 경고로 건너뛴다. 404·형식 오류는 주소나
 # 응답 형식이 바뀐 것일 수 있어 그대로 FAIL이다.
@@ -530,7 +590,7 @@ def check_consensus():
     else:
         print(f"    ok   전제 — 모바일 API 추정 열은 연간·분기 각 1개 이하 ({len(STOCKS)}종목)")
 
-    for code, name in [("005930", "삼성전자"), ("000660", "SK하이닉스")]:
+    for code, name in [("005930", "삼성전자"), ("000660", "SK하이닉스"), ("011170", "롯데케미칼")]:
         for period in ("annual", "quarter"):
             tag = f"{name} {period}"
             output = server.stock_consensus(code, period)
@@ -549,6 +609,32 @@ def check_consensus():
             _, header, rows = main
             col = {label: index for index, label in enumerate(header)}
             by_period = {r[0][:7]: r for r in rows}
+            # 표의 칸은 원본 그대로여야 한다 — 적자 기간 PER만 '적자(원래 값)', 결산 주기가 1년이 아닌 표의
+            # YoY만 다시 계산한 값이다.
+            raw = fetch(server._consensus_url(code, 2, 0 if period == "annual" else 1))
+            if "__error__" in raw:
+                skip_if_external(f"{tag} 표 원본", raw) or print(
+                    f"    warn {tag} 표 원본 조회 실패 — 원본 대조만 건너뜀 ({raw['__error__']})")
+            else:
+                keys = [k for k, _ in server._CNS_COLUMNS]
+                recomputed = "결산 주기가 1년이 아닙니다" in output
+                off = []
+                for r, source in zip(rows, raw.get("JsonData") or []):
+                    for key, cell in zip(keys, r[1:]):
+                        want = str(source.get(key) or "-")
+                        if key == "PER" and (server._negative(source.get("PER")) or server._negative(source.get("EPS"))):
+                            want = f"적자({want})" if want != "-" else "적자"
+                        if key == "YOY" and recomputed:
+                            continue
+                        if cell != want:
+                            off.append(f"{r[0]} {key} 표 {cell} vs 원본 {want}")
+                if off or len(rows) != len(raw.get("JsonData") or []):
+                    print(f"    FAIL {tag} 표가 원본과 다르다: {off[:3]} (행 {len(rows)} vs {len(raw.get('JsonData') or [])})")
+                    problems.append(f"stock_consensus({tag}) 표 칸이 원본과 다르다")
+            issues = loss_label_problems(sections)
+            if issues:
+                print(f"    FAIL {tag} 적자 PER 표시가 어긋났다: {issues[:3]}")
+                problems.append(f"stock_consensus({tag}) 적자 PER 표시가 어긋났다")
             estimates = [r for r in rows if "(E)" in r[0] and any(c != "-" for c in r[1:])]
             # 모바일 API는 추정이 1개 기간뿐이었다 — 이 도구를 만든 이유다.
             if len(estimates) < 2:
@@ -597,17 +683,27 @@ def check_consensus():
                         f"    warn {tag} 추이 {title[:10]} 원본 조회 실패 — 원본 대조만 건너뜀 ({raw['__error__']})")
                 items = [] if "__error__" in raw else raw.get("JsonData") or []
                 shown_rows = {t[0]: t for t in trend_rows}
+                eps_values = next(([i.get(f"VAL{n}") for n in range(1, 6)] for i in items
+                                   if str(i.get("ACC_NM", "")).startswith("EPS")), [None] * 5)
                 for item in items:
                     acc_name, values = item.get("ACC_NM", ""), [item.get(f"VAL{n}") for n in range(1, 6)]
                     present = [isinstance(v, (int, float)) and v != 0 for v in values]
                     cells = shown_rows.get(acc_name)
                     digits = 1 if "(억원)" in acc_name else 0 if "(원)" in acc_name else 2
+                    # 적자 시점 PER은 '적자(원래 값)', 원래 값이 없으면 '적자'
+                    loss = [acc_name.startswith("PER") and (server._negative(v) or server._negative(e))
+                            for v, e in zip(values, eps_values)]
                     if cells is None:
-                        wrong = any(present)
+                        wrong = any(present) or any(loss)
                     else:
-                        wrong = any(cell != "-" if not ok else
-                                    _float(cell) is None or abs(_float(cell) - v) > 0.5 * 10 ** -digits + 1e-9
-                                    for v, ok, cell in zip(values, present, cells[1:]))
+                        labels_wrong = any((cell != "적자" if not ok else not cell.startswith("적자(")) if is_loss
+                                           else cell.startswith("적자")
+                                           for ok, cell, is_loss in zip(present, cells[1:], loss))
+                        values_wrong = any(_plain(cell) != "-" if not ok else
+                                           _float(_plain(cell)) is None
+                                           or abs(_float(_plain(cell)) - v) > 0.5 * 10 ** -digits + 1e-9
+                                           for v, ok, cell in zip(values, present, cells[1:]))
+                        wrong = labels_wrong or values_wrong
                     if wrong:
                         trend_off += 1
                         print(f"    FAIL {tag} 추이 {title[:10]} {acc_name}: 표 {cells and cells[1:]} vs 원본 {values}")
@@ -620,7 +716,7 @@ def check_consensus():
                 trend_checked += 1
                 for acc_name, (label, tolerance) in TREND_TO_TABLE.items():
                     cells = shown_rows.get(acc_name)
-                    a, b = (_float(cells[1]) if cells else None), _float(row[col[label]])
+                    a, b = (_float(_plain(cells[1])) if cells else None), _float(_plain(row[col[label]]))
                     if a is not None and b is not None and abs(a - b) > tolerance:
                         trend_off += 1
                         print(f"    FAIL {tag} 추이 {title[:10]} 기준일 {acc_name} {cells[1]} ≠ 표 {row[col[label]]}")
@@ -683,6 +779,10 @@ def check_consensus():
         if main is None:
             failed.append(name)
             continue
+        issues = loss_label_problems(consensus_tables(output))
+        if issues:
+            print(f"    FAIL {name} 적자 PER 표시가 어긋났다: {issues[:3]}")
+            problems.append(f"stock_consensus({name}) 적자 PER 표시가 어긋났다")
         estimates = [r for r in main[2] if "(E)" in r[0]]
         blank = all(c == "-" for r in estimates for c in r[1:])
         if blank != ("현재 컨센서스 추정치가 없습니다" in output):

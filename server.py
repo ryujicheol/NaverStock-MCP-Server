@@ -520,6 +520,17 @@ def _why(data):
     return str(data.get("error"))[:80] if isinstance(data, dict) and "error" in data else "응답 형식이 다름"
 
 
+def _negative(value):
+    """표의 문자열('-14.34', '-4,199')이든 추이의 숫자(-14.337)든 음수인가."""
+    number = value if isinstance(value, (int, float)) else _num(value or "-")
+    return number is not None and number < 0
+
+
+def _loss_per(cell):
+    """적자 기간의 PER 칸 → '적자(-14.34)'. 원래 값이 없으면 '적자'."""
+    return f"적자({cell})" if cell and cell != "-" else "적자"
+
+
 def _yoy_by_year(rows):
     """연간 표 행 간격이 12개월이 아니면(6개월 결산 리츠 등) YoY를 1년 전 같은 결산기 대비로 다시 계산한다.
 
@@ -601,10 +612,17 @@ def stock_consensus(code: str, period: str = "annual") -> str:
     lines += ["", "[실적·추정]", "| 기간 | " + " | ".join(n for _, n in _CNS_COLUMNS) + " |",
               "|" + "------|" * (len(_CNS_COLUMNS) + 1)]
     cycle = _yoy_by_year(rows) if frq == 0 else None
+    per_at = [k for k, _ in _CNS_COLUMNS].index("PER")
+    losses = False
     for index, r in enumerate(rows):
         # 재무 기준이 기간마다 다르면(별도 → 연결 전환 등) 기간 옆에 적는다.
         basis = f" {r['MAIN']}" if len(bases) > 1 and r.get("MAIN") else ""
         cells = [cycle[0][index] if cycle and k == "YOY" else str(r.get(k) or "-") for k, _ in _CNS_COLUMNS]
+        # 적자면 PER을 '적자(원래 값)'으로 쓴다 — 사용자 결정(2026-09-25). 음수 PER은 배수로서 뜻이 없고 크기가
+        # 적자 규모에 반비례해 거꾸로 읽힌다(롯데케미칼 2027E: EPS −1,366 → −5,638로 적자가 4배 커지는 동안
+        # PER은 −46.04 → −10.68로 0에 가까워졌다). 괄호의 원래 값은 네이버 화면 대조용이다.
+        if _negative(r.get("PER")) or _negative(r.get("EPS")):
+            cells[per_at], losses = _loss_per(cells[per_at]), True
         lines.append(f"| {r.get('YYMM', '')}{basis} | " + " | ".join(cells) + " |")
     estimates = [r for r in rows if "(E)" in r.get("YYMM", "")]
     if not any(r.get(k) for r in estimates for k, _ in _CNS_COLUMNS):
@@ -622,9 +640,14 @@ def stock_consensus(code: str, period: str = "annual") -> str:
         trend_lines += ["", f"{name} — 기준일 {_fmt_yyyymmdd(items[0].get('DT'))}",
                         f"| 항목 | {_fmt_yyyymmdd(items[0].get('DT'))} | " + " | ".join(_CNS_TREND_COLUMNS) + " |",
                         "|" + "------|" * (len(_CNS_TREND_COLUMNS) + 2)]
+        eps = next((i for i in items if str(i.get("ACC_NM", "")).startswith("EPS")), {})
         for i in items:
             acc = i.get("ACC_NM", "")
             cells = [_cns_number(i.get(f"VAL{n}"), acc) for n in range(1, 6)]
+            if acc.startswith("PER"):  # 표와 같이 그 시점 EPS가 음수면 '적자(원래 값)'
+                for n in range(1, 6):
+                    if _negative(i.get(f"VAL{n}")) or _negative(eps.get(f"VAL{n}")):
+                        cells[n - 1], losses = _loss_per(cells[n - 1]), True
             if any(c != "-" for c in cells):  # 분기 추이의 ROE처럼 전부 빈 항목은 뺀다
                 trend_lines.append(f"| {acc} | " + " | ".join(cells) + " |")
     if not listed_ok:
@@ -688,6 +711,10 @@ def stock_consensus(code: str, period: str = "annual") -> str:
         "단위 — 매출액·영업이익·순이익: 억원, EPS·BPS: 원, PER·PBR·EV/EBITDA: 배, YoY·ROE: %. "
         "IFRS 연결 회사의 순이익·BPS·ROE는 지배주주 기준입니다.",
     ]
+    if losses:
+        notes.append("PER은 EPS가 음수(적자)면 `적자`로 적고 괄호에 원래 값(네이버 화면의 음수 PER)을 남깁니다. "
+                     "괄호 숫자는 화면 대조용일 뿐입니다 — 음수 PER의 크기는 적자 규모에 반비례하고 주가 변동도 섞여서, "
+                     "그 크기나 변화로 적자폭을 판단하면 거꾸로 읽힙니다. 적자폭은 EPS·순이익으로 보세요.")
     # (E)의 PER은 기준일 정규장 종가 ÷ EPS(E)다 — 2026-09-23 삼성전자 285,500 ÷ 47,922 = 5.96(애프터마켓
     # 종가 286,500이면 5.98). (A)는 결산기 말 종가다 — 2024년 53,200 ÷ 4,950 = 10.75, 2023년 78,500 ÷ 2,131 = 36.84.
     if frq == 0:
@@ -779,14 +806,15 @@ def _frame_cell(rows, titles, idx, name):
 
 
 def _per(price, eps):
-    """현재가 ÷ EPS. 적자(EPS 음수)면 '적자', 값이 없으면 '-'.
+    """현재가 ÷ EPS. 적자(EPS 음수)면 '적자(-14.48)'처럼 계산값을 괄호에 남기고, 값이 없으면 '-'.
 
     음수 PER은 "10배 이하" 같은 필터를 숫자로는 통과하고, 크기 순서도 뜻이 없다
     (적자가 클수록 0에 가깝다 — 카카오게임즈 -7.55가 엘앤에프 -80.25보다 적자가 크다).
+    괄호 값은 stock_consensus와 같은 표시다(사용자 결정 2026-09-25) — 정렬에선 숫자가 아니라 맨 아래로 간다.
     """
     price_val, eps_val = _to_int(price), _to_int(eps)
     if eps_val is not None and eps_val < 0:
-        return "적자"
+        return f"적자({price_val / eps_val:.2f})" if price_val else "적자"
     if not price_val or not eps_val:
         return "-"
     return f"{price_val / eps_val:.2f}"
@@ -842,7 +870,7 @@ def _compare_one(code, quote):
         "fwd_per": fwd_per,
         "fwd_eps": fwd_eps,
         # 선행PER이 숫자가 아니면(적자·값 없음) `*`를 달지 않는다.
-        "fallback": fallback and fwd_per not in ("-", "적자"),
+        "fallback": fallback and fwd_per != "-" and not fwd_per.startswith("적자"),
         "pbr": pbr,
         "opm_fixed": _frame_cell(rows, titles, fixed_idx, "영업이익률"),
         "opm_est": _frame_cell(rows, titles, est_idx, "영업이익률"),
@@ -863,7 +891,7 @@ def stock_compare(codes: str, sort_by: str = "") -> str:
     반환 항목: 현재가·시총·PER·선행PER·EPS(E)·PBR·영업이익률(최근 확정/추정)·ROE(E).
     시총·PER·선행PER·PBR은 모두 표의 현재가로 계산합니다(PER = 현재가 ÷ EPS, 선행PER = 현재가 ÷ EPS(E)).
     표 위에 현재가 기준(정규장 실시간 / 애프터마켓 / 장 마감)과 조회 시각을 표시합니다.
-    PER·선행PER은 적자면 '적자', 값이 없으면 '-'. 우선주(†)는 EPS·BPS가 보통주 값이라 배수가 낮게 나옵니다.
+    PER·선행PER은 적자면 '적자(계산값)', 값이 없으면 '-'. 우선주(†)는 EPS·BPS가 보통주 값이라 배수가 낮게 나옵니다.
     """
     # 응답 코드가 대문자라 입력도 대문자로 맞춘다. 같은 코드는 한 번만 조회한다(두 줄로 나오고 한도만 먹었다).
     entered = [c.strip().upper() for c in codes.replace("\n", ",").replace(" ", ",").split(",") if c.strip()]
@@ -931,6 +959,10 @@ def stock_compare(codes: str, sort_by: str = "") -> str:
         "단위 — 현재가·EPS(E): 원, PER·PBR: 배, OPM·ROE: %. 시총·PER·선행PER·PBR은 모두 표의 "
         "현재가로 계산했습니다(선행PER = 현재가 ÷ EPS(E)). PER·선행PER은 적자면 `적자`, 값이 없으면 `-`입니다."
     ]
+    if any(str(r.get(key, "")).startswith("적자(") for r in ok for key in ("per", "fwd_per")):
+        notes.append("`적자(…)`의 괄호 값은 현재가 ÷ EPS 계산값을 남긴 것뿐입니다 — 음수 PER은 크기가 적자 규모에 "
+                     "반비례하고 주가 변동도 섞여서, 그 크기나 변화로 적자폭을 판단하면 거꾸로 읽힙니다. "
+                     "적자폭은 `EPS(E)`로 보세요. 정렬에선 적자 행이 맨 아래로 갑니다.")
 
     fixed_labels = {r["fixed_label"] for r in ok if r["fixed_label"]}
     est_labels = {r["est_label"] for r in ok if r["est_label"]}

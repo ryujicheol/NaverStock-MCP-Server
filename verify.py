@@ -19,6 +19,7 @@ import json
 import re
 import sys
 import types
+import urllib.parse
 import urllib.request
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
@@ -96,6 +97,29 @@ def fetch(url):
             return json.loads(response.read().decode())
     except Exception as exc:  # noqa: BLE001
         return {"__error__": str(exc)[:60]}
+
+
+def opinion_rows(code):
+    """기업현황 페이지 '제공처별 투자의견' 표에서 투자의견이 있는 행 수, 실패하면 None.
+
+    도구의 추정기관수는 같은 페이지의 '투자의견 컨센서스' 표에서 읽는다. 다른 표로 세어 맞춰 보면 파싱과 함께
+    '최근 3개월 투자의견을 낸 증권사 수'라는 각주의 전제(2026-09-27 시총 상위 173종목 모두 같았다)도 확인된다.
+    투자의견이 하나도 없으면 '의견이 없습니다' 한 칸짜리 행만 있어 0이다.
+    """
+    try:
+        request = urllib.request.Request(f"{server.WISEREPORT_COMPANY_PAGE}?cmp_cd={code}", headers=UA)
+        with urllib.request.urlopen(request, timeout=12) as response:
+            page = response.read().decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return None
+    start = page.find('id="cTB24"')
+    if start < 0:
+        return None
+    count = 0
+    for row in re.findall(r"<tr[^>]*>(.*?)</tr>", page[start:page.find("</table>", start)], re.S):
+        cells = [re.sub(r"<[^>]+>|&nbsp;|\s", "", c) for c in re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)]
+        count += len(cells) >= 7 and bool(cells[5])  # 제공처·일자·목표가·직전목표가·변동률·투자의견·직전투자의견
+    return count
 
 
 def check_referenced_fields():
@@ -306,13 +330,69 @@ def check_compare_table():
         print(f"    ok   시총·PER·PBR = 그 행의 현재가 기준 — {cells}칸 검산 일치, "
               f"후행 적자 {trailing_losses}행은 '적자(현재가 ÷ EPS)'")
 
+    # 선행PER+1·+2 = 그 행의 현재가 ÷ 선행PER 다음 해·그다음 해 EPS(E) — WiseReport 표(우선주는 보통주 코드)에서
+    # 모바일 API 추정 열의 연도로 짝을 찾는다. 전제: 그 연도의 WiseReport EPS = 표의 EPS(E)(같은 컨센서스, 1원 반올림 차).
+    # 기관수는 '제공처별 투자의견' 표의 투자의견 있는 행 수와 같아야 한다.
+    later_cells = later_off = aligned = count_cells = count_off = 0
+    for r, code in zip(valid, codes):
+        price = server._to_int(r[col["현재가"]])
+        base_code = code[:5] + "0" if "†" in r[0] else code
+        wise, mobile = fetch(server._consensus_url(base_code, 2, 0)), fetch(
+            f"https://m.stock.naver.com/api/stock/{code}/finance/annual")
+        if "__error__" in wise or "__error__" in mobile:
+            skip_if_external(f"stock_compare {r[0]} 선행PER+1·+2 원본", wise) or print(
+                f"    warn stock_compare {r[0]} 원본 조회 실패 — 선행PER+1·+2 검산 건너뜀")
+            continue
+        estimated = {x["YYMM"][:7]: x.get("EPS") for x in wise.get("JsonData") or [] if "(E)" in x.get("YYMM", "")}
+        title = next((t.get("title", "") for t in (mobile.get("financeInfo") or {}).get("trTitleList") or []
+                      if t.get("isConsensus") == "Y"), "")
+        base = title[:7] or min(estimated, default="")
+        first, shown_eps = server._to_int(estimated.get(base)), server._to_int(r[col["EPS(E)"]])
+        if first is not None and shown_eps is not None:
+            aligned += 1
+            if abs(first - shown_eps) > 1:
+                later_off += 1
+                print(f"    FAIL {r[0]} 첫 추정 연도({base}) WiseReport EPS {first:,} ≠ 표 EPS(E) {shown_eps:,} — 연도 짝이 어긋났다")
+                problems.append(f"stock_compare 선행PER+1·+2의 기준 연도가 EPS(E)와 어긋났다: {r[0]}")
+        for n, label in ((1, "선행PER+1"), (2, "선행PER+2")):
+            eps = server._to_int(estimated.get(f"{int(base[:4]) + n}{base[4:]}")) if base else None
+            got = r[col[label]]
+            if not price or not eps:
+                same = got == "-"
+                want = "-"
+            elif eps < 0:
+                want = f"적자({price / eps:.2f})"
+                same = got == want
+            else:
+                want = f"{price / eps:.2f}"
+                same = _float(got) is not None and abs(_float(got) - price / eps) <= 0.006
+            later_cells += 1
+            if not same:
+                later_off += 1
+                print(f"    FAIL {label} {r[0]}: 표 {got} ≠ 현재가 {price:,} ÷ {base} 다음 {n}년 EPS {eps} = {want}")
+                problems.append(f"stock_compare {label}이 현재가 ÷ 그 해 EPS(E)가 아니다: {r[0]}")
+        rows_with_opinion = opinion_rows(base_code)
+        if rows_with_opinion is None:
+            print(f"    warn {r[0]} 제공처별 투자의견 표 조회 실패 — 기관수 대조 건너뜀")
+            continue
+        count_cells += 1
+        if r[col["기관수"]] != str(rows_with_opinion):
+            count_off += 1
+            print(f"    FAIL 기관수 {r[0]}: 표 {r[col['기관수']]} ≠ 투자의견 낸 증권사 {rows_with_opinion}곳")
+            problems.append(f"stock_compare 기관수가 최근 3개월 투자의견 수와 다르다: {r[0]}")
+    if not later_off:
+        print(f"    ok   선행PER+1·+2 = 현재가 ÷ 그다음 두 해 EPS(E) — {later_cells}칸 검산 일치, "
+              f"첫 추정 연도 짝 {aligned}행 확인")
+    if not count_off and count_cells:
+        print(f"    ok   기관수 = 최근 3개월 투자의견을 낸 증권사 수 — {count_cells}행 일치")
+
 
 def check_compare_sort():
     print("\n" + "=" * 62)
     print("[5] stock_compare 정렬 — 숫자는 순서대로, 적자·값 없음·조회 실패는 맨 아래")
     print("=" * 62)
     codes = ",".join(code for code, _ in STOCKS) + ",091990"
-    for sort_by, descending in [("선행PER", False), ("ROE(E)", True)]:
+    for sort_by, descending in [("선행PER", False), ("선행PER+1", False), ("ROE(E)", True)]:
         markdown = server.stock_compare(codes, sort_by=sort_by)
         table = [l for l in markdown.split("\n") if l.startswith("|")]
         if len(table) < 3:
@@ -404,10 +484,11 @@ def check_edges():
 
     # 적자 추정인데 종목 상세에 추정EPS가 없어 실적표로 보완한 행 — 선행PER이 '적자(…)'라 숫자가 아니므로
     # `*`는 붙지 않아야 한다(옛 조건 `not in ("-", "적자")`는 괄호가 붙자 `*`를 달았다). 지금 살아 있는
-    # 종목엔 이 경우가 없어(2026-09-25) 가짜 응답으로 본다.
-    saved_fetch = server._fetch
+    # 종목엔 이 경우가 없어(2026-09-25) 가짜 응답으로 본다. 선행PER+1·+2는 연도로 짝을 찾아야 하고(WiseReport 표에
+    # 2025.12(A)가 끼어 있어도), 그 해 추정이 적자면 '적자(…)', 없으면 '-', WiseReport 조회 실패는 '?'다.
+    saved = server._fetch, server._analyst_count
 
-    def fake_fetch(url):
+    def fake_fetch(url, broken=False):
         if url.endswith("/integration"):
             return {"totalInfos": [{"key": "EPS", "value": "-1,000원"}, {"key": "BPS", "value": "10,000원"}]}
         if url.endswith("/finance/annual"):
@@ -415,18 +496,31 @@ def check_edges():
                 "trTitleList": [{"key": "202512", "title": "2025.12.", "isConsensus": "N"},
                                 {"key": "202612", "title": "2026.12.", "isConsensus": "Y"}],
                 "rowList": [{"title": "EPS", "columns": {"202612": {"value": "-500"}}}]}}
-        return saved_fetch(url)
+        if url.startswith(server.WISEREPORT_CONSENSUS_API):
+            return {"error": "timed out"} if broken else {"JsonData": [
+                {"YYMM": "2025.12(A)", "EPS": "300"}, {"YYMM": "2028.12(E)", "EPS": ""},
+                {"YYMM": "2026.12(E)", "EPS": "-500"}, {"YYMM": "2027.12(E)", "EPS": "-250"}]}
+        return saved[0](url)
 
-    server._fetch = fake_fetch
-    try:
-        row = server._compare_one("000000", {"closePrice": "10,000", "stockName": "가짜"})
-    finally:
-        server._fetch = saved_fetch
+    rows = {}
+    for broken in (False, True):
+        server._fetch = lambda url, broken=broken: fake_fetch(url, broken)
+        server._analyst_count = lambda code, broken=broken: (None, "timed out") if broken else (3, None)
+        try:
+            rows[broken] = server._compare_one("000000", {"closePrice": "10,000", "stockName": "가짜"})
+        finally:
+            server._fetch, server._analyst_count = saved
+    row = rows[False]
     ok = (row["fwd_per"], row["per"], row["fallback"]) == ("적자(-20.00)", "적자(-10.00)", False)
     print(f"    {'ok  ' if ok else 'FAIL'} 적자 + 추정EPS 보완 행 → 선행PER {row['fwd_per']}, PER {row['per']}, "
           f"`*` {'없음' if not row['fallback'] else '붙음'}")
     if not ok:
         problems.append("stock_compare 적자 보완 행의 표시가 어긋났다(`*` 또는 적자 괄호)")
+    got = [(r["fwd_per1"], r["fwd_per2"], r["analysts"]) for r in (rows[False], rows[True])]
+    ok = got == [("적자(-40.00)", "-", "3"), ("?", "?", "?")]
+    print(f"    {'ok  ' if ok else 'FAIL'} 선행PER+1·+2·기관수 — 연도 짝·적자·추정 없음 {got[0]}, 조회 실패 {got[1]}")
+    if not ok:
+        problems.append(f"stock_compare 선행PER+1·+2·기관수 표시가 어긋났다: {got}")
 
     # 우선주는 EPS·BPS가 보통주 값이라 배수가 낮게 나온다 — 행에 †와 주석이 붙어야 한다
     # (2026-09-23 리뷰). 주석의 전제(보통주 값과 같다)도 함께 본다. 네이버가 우선주 자체 EPS를
@@ -439,6 +533,24 @@ def check_edges():
     else:
         print(f"    FAIL 우선주 표시가 어긋났다: {names}")
         problems.append("stock_compare 우선주 표시가 어긋났다")
+    # WiseReport는 우선주 코드엔 빈 목록이라 보통주 코드로 받는다 — 우선주 행의 선행PER+1·+2 = 우선주 현재가 ÷ 보통주
+    # EPS(E)(선행PER이 보통주 EPS를 쓰는 것과 같은 방식)라 보통주 행 값 × 가격 비율이어야 하고, 기관수도 보통주 값이다.
+    # 보통주 행 자체의 선행PER+1·+2는 [4]에서 검산한다.
+    table = [[c.strip() for c in l.strip("|").split("|")] for l in output.split("\n") if l.startswith("|")]
+    col = {label: index for index, label in enumerate(table[0])}
+    common, pref = (next((r for r in table[2:] if r[0].endswith(f"({code})")), None) for code in ("005930", "005935"))
+    if pref is None or common is None:
+        print("    FAIL 우선주 비교 표에 삼성전자·삼성전자우 행이 없다")
+        problems.append("stock_compare 우선주 비교 표가 어긋났다")
+    else:
+        ratio = server._to_int(pref[col["현재가"]]) / server._to_int(common[col["현재가"]])
+        pairs = [(_float(pref[col[label]]), _float(common[col[label]])) for label in ("선행PER+1", "선행PER+2")]
+        ok = all(p is not None and c is not None and abs(p - c * ratio) <= 0.01 for p, c in pairs) \
+            and pref[col["기관수"]] == common[col["기관수"]]
+        print(f"    {'ok  ' if ok else 'FAIL'} 우선주 선행PER+1·+2 = 보통주 값 × 가격 비율 {pairs}, "
+              f"기관수 {pref[col['기관수']]} = 보통주 {common[col['기관수']]}")
+        if not ok:
+            problems.append("stock_compare 우선주 행의 선행PER+1·+2·기관수가 보통주 컨센서스가 아니다")
     common, pref = ({i["code"]: i["value"] for i in fetch(
         f"https://m.stock.naver.com/api/stock/{code}/integration").get("totalInfos", [])}
         for code in ("005930", "005935"))
@@ -581,6 +693,52 @@ def call_consensus(label, *args):
     return output
 
 
+def note_problems(output):
+    """stock_consensus 출력이 스스로 맞는가 — 각주가 붙을 조건과 각주가 함께 가야 한다.
+
+    ① 투자의견 행만 있는 추이 표가 없어야 한다(추정이 없는 기간 — 저스템 2028년이 그렇게 나왔다) ② 영업이익 > 매출액
+    행이 있으면 그 각주 ③ 서프라이즈 매출액 실적이 위 표 (A)와 5% 넘게 다르면 그 각주 ④ 각주의 기준 주가 ÷ EPS·BPS가
+    (E) PER·PBR과 맞는지 — 안 맞는 칸이 있을 때만 '맞지 않습니다'. → (문제 목록, 검산한 칸 수)
+    """
+    sections = consensus_tables(output)
+    main = (sections.get("실적·추정") or [None])[0]
+    if main is None:
+        return [], 0
+    _, header, rows = main
+    col = {label.split("(")[0]: index for index, label in enumerate(header)}
+    issues = [f"투자의견만 있는 추이 표: {title[:10]}" for title, _, trows in sections.get("컨센서스 추이") or []
+              if trows and all(t[0].startswith("투자의견") for t in trows)]
+    op_over = [r[0] for r in rows if (_float(r[col["매출액"]]) or 0) > 0
+               and (_float(r[col["영업이익"]]) or 0) > _float(r[col["매출액"]])]
+    if bool(op_over) != ("영업이익이 매출액보다 큰 기간이 있습니다" in output):
+        issues.append(f"영업이익 > 매출액 각주가 어긋났다(해당 행 {op_over})")
+    gaps = []
+    for _, _, srows in sections.get("어닝서프라이즈") or []:
+        for s in srows:
+            actual = _float(s[2].split(" (")[0])
+            same = [r for r in rows if "(A)" in r[0] and r[0].startswith(s[0].replace("/", "."))]
+            listed = _float(same[0][col["매출액"]]) if len(same) == 1 else None
+            if s[1] == "매출액" and actual and listed and abs(listed / actual - 1) > 0.05:
+                gaps.append(s[0])
+    if bool(gaps) != ("매출액 실적이 위 표 (A)와 5% 넘게 다릅니다" in output):
+        issues.append(f"서프라이즈 매출액 각주가 어긋났다(5% 넘게 다른 결산기 {gaps})")
+    m = re.search(r"정규장 종가 ([\d,]+)원 기준", output)
+    off, checked = [], 0
+    if m:
+        price = int(m.group(1).replace(",", ""))
+        for r in rows:
+            for multiple, per_share in (("PER", "EPS"), ("PBR", "BPS")):
+                shown, value = _float(_plain(r[col[multiple]])), _float(r[col[per_share]])
+                if "(E)" not in r[0] or shown is None or not value:
+                    continue
+                checked += 1
+                if abs(shown - price / value) > 0.005 + price * 0.5 / value ** 2 + 1e-9:
+                    off.append(f"{r[0]} {multiple} {r[col[multiple]]} vs {price:,} ÷ {r[col[per_share]]}")
+    if bool(off) != ("맞지 않습니다" in output):
+        issues.append(f"기준 주가 각주와 검산이 다르다(어긋난 칸 {off[:2]})")
+    return issues, checked
+
+
 # 추이 항목 → 실적·추정 표의 열, 허용 오차(억원은 표가 소수 한 자리, 추이가 정수 반올림)
 TREND_TO_TABLE = {
     "매출액(억원)": ("매출액", 1), "영업이익(억원)": ("영업이익", 1), "순이익(억원)": ("순이익", 1),
@@ -610,12 +768,27 @@ def check_consensus():
         print(f"    ok   전제 — 모바일 API 추정 열은 연간·분기 각 1개 이하 ({len(STOCKS)}종목)")
 
     for code, name in [("005930", "삼성전자"), ("000660", "SK하이닉스"), ("011170", "롯데케미칼")]:
+        rows_with_opinion = opinion_rows(code)
         for period in ("annual", "quarter"):
             tag = f"{name} {period}"
             output = call_consensus(tag, code, period)
             if skip_if_external(tag, output):
                 continue
             sections = consensus_tables(output)
+            # 추정기관수 = 제공처별 투자의견 표의 투자의견 수. (E) PER·PBR = 각주의 기준일 정규장 종가 ÷ EPS·BPS —
+            # 이 세 종목은 맞아야 한다(전제: 2026-09-27 109종목 중 108개. 어긋나면 FnGuide 계산이 바뀐 것이니 각주를 볼 것).
+            count = re.search(r"^추정기관수: (\d+)곳", output, re.M)
+            if rows_with_opinion is not None and (count is None or int(count.group(1)) != rows_with_opinion):
+                print(f"    FAIL {tag} 추정기관수 {count and count.group(1)} ≠ 투자의견 낸 증권사 {rows_with_opinion}곳")
+                problems.append(f"stock_consensus({tag}) 추정기관수가 최근 3개월 투자의견 수와 다르다")
+            issues, priced = note_problems(output)
+            if "맞지 않습니다" in output or not priced:
+                issues.append(f"(E) PER·PBR이 기준일 정규장 종가 ÷ EPS·BPS로 검산되지 않는다(검산 {priced}칸)")
+            if issues:
+                print(f"    FAIL {tag} {issues[:3]}")
+                problems.append(f"stock_consensus({tag}) 각주·검산이 어긋났다")
+            else:
+                print(f"    ok   {tag} 추정기관수 {rows_with_opinion}곳 일치, (E) PER·PBR = 기준 주가 ÷ EPS·BPS {priced}칸")
             # 분기 각주(연환산 아님)는 분기 표에만 붙어야 한다 — 연간 표에 붙은 회귀가 있었다(if/else 어긋남).
             if ("분기의 PER·ROE·EV/EBITDA" in output) != (period == "quarter"):
                 print(f"    FAIL {tag} 분기 각주가 {'없다' if period == 'quarter' else '연간 표에 붙었다'}")
@@ -800,8 +973,10 @@ def check_consensus():
 
     # 추정이 없는 종목(지금은 에스티아이·한화리츠·엘브이엠씨홀딩스)은 그렇다고 말해야 하고, 추정이 있는
     # 종목엔 그 말이 없어야 한다. 종목의 커버리지가 바뀌어도 이 검사는 스스로 맞다.
-    mismatched, failed, checked_names = [], [], 0
-    for code, name in STOCKS + [("039440", "에스티아이"), ("310210", "보로노이")]:
+    mismatched, failed, checked_names, noted = [], [], 0, []
+    # SK스퀘어는 지금 영업이익 > 매출액·서프라이즈 매출액 차이·기준 주가 불일치 각주가 모두 붙는 종목이다(2026-09-27).
+    for code, name in STOCKS + [("039440", "에스티아이"), ("310210", "보로노이"), ("402340", "SK스퀘어"),
+                                ("417840", "저스템")]:
         output = call_consensus(name, code)
         if skip_if_external(f"{name} 추정 없음 안내", output):
             continue
@@ -810,7 +985,7 @@ def check_consensus():
         if main is None:
             failed.append(name)
             continue
-        issues = loss_label_problems(consensus_tables(output))
+        issues = loss_label_problems(consensus_tables(output)) + note_problems(output)[0]
         # 각주는 해당 칸이 있을 때만 — 자본잠식 라벨, 음수 EV/EBITDA(값은 두고 각주만).
         cells = [c for tables in consensus_tables(output).values() for _, _, rows in tables for r in rows for c in r[1:]]
         ev_negative = any((_float(r[10]) or 0) < 0 for r in main[2] if len(r) == 11)
@@ -819,8 +994,9 @@ def check_consensus():
         if ev_negative != ("EV/EBITDA가 음수인 칸은" in output):
             issues.append(f"EV/EBITDA 각주가 어긋남(음수 칸 {ev_negative})")
         if issues:
-            print(f"    FAIL {name} 적자·자본잠식 표시가 어긋났다: {issues[:3]}")
-            problems.append(f"stock_consensus({name}) 적자·자본잠식 표시가 어긋났다")
+            print(f"    FAIL {name} 표시·각주가 어긋났다: {issues[:3]}")
+            noted.append(name)
+            problems.append(f"stock_consensus({name}) 표시·각주가 어긋났다")
         estimates = [r for r in main[2] if "(E)" in r[0]]
         blank = all(c == "-" for r in estimates for c in r[1:])
         if blank != ("현재 컨센서스 추정치가 없습니다" in output):
@@ -828,8 +1004,9 @@ def check_consensus():
     if failed or mismatched:
         print(f"    FAIL 표가 없음 {failed} / 추정 없음 안내 불일치 {mismatched}")
         problems.append(f"stock_consensus 표 없음 {failed} 또는 추정 없음 안내 불일치 {mismatched}")
-    elif checked_names:
-        print(f"    ok   {checked_names}종목 모두 표가 나오고, 추정이 빈 종목에만 '추정치가 없습니다'")
+    elif checked_names and not noted:
+        print(f"    ok   {checked_names}종목 모두 표가 나오고, 추정이 빈 종목에만 '추정치가 없습니다' — 적자·자본잠식 "
+              "표시와 각주(영업이익 > 매출액·서프라이즈 매출액 차이·기준 주가 검산)가 조건과 일치, 투자의견만 있는 추이 표 없음")
     # 결산 주기가 6개월인 리츠는 원본 YoY에 직전 결산기 대비가 섞여 있다(한화리츠 2026.04: 원본 3.50%,
     # 1년 전 대비 7.53%). 도구의 YoY는 1년 전 같은 결산기 대비이거나, 그 결산기가 표에 없으면 비어야 한다.
     # 한화리츠가 결산 주기를 바꾸거나 상장폐지되면 다른 6개월 결산 리츠(롯데리츠 330590 등)로 바꿀 것.
@@ -871,8 +1048,78 @@ def check_consensus():
         print(f"    {'ok  ' if ok else 'FAIL'} {label} → 데이터 없음 안내")
         if not ok:
             problems.append(f"stock_consensus {label} 안내가 어긋났다")
+
+    # brief=True는 실적·추정 표가 전체 출력과 같고 추이·서프라이즈가 없어야 한다(출력 크기 리뷰 2026-09-27).
+    full, brief = call_consensus("삼성전자 전체", "005930"), call_consensus("삼성전자 brief", "005930", "annual", True)
+    if not (skip_if_external("삼성전자 전체", full) or skip_if_external("삼성전자 brief", brief)):
+        same = consensus_tables(full).get("실적·추정") == consensus_tables(brief).get("실적·추정")
+        extra = [s for s in ("[컨센서스 추이]", "[어닝서프라이즈]") if s in brief]
+        head = [l for l in full.split("\n") if l.startswith(("종목", "추정기관수"))] == \
+               [l for l in brief.split("\n") if l.startswith(("종목", "추정기관수"))]
+        ok = same and not extra and head and "brief=True라" in brief and len(brief) < len(full) * 0.45
+        print(f"    {'ok  ' if ok else 'FAIL'} brief — 표·머리 같음 {same and head}, 뺀 섹션 남음 {extra}, "
+              f"{len(brief):,}자 / 전체 {len(full):,}자")
+        if not ok:
+            problems.append("stock_consensus brief 출력이 어긋났다")
+
+    fake_consensus()
     if skipped:
         print(f"    warn WiseReport 응답이 없어 건너뛴 검사 {len(skipped)}개 — 로컬에서 python verify.py로 다시 볼 것")
+
+
+def fake_consensus():
+    """가짜 응답으로 본다 — 살아 있는 종목은 바뀌어 검사가 공회전할 수 있다(저스템에 2028년 추정이 생기는 등).
+
+    투자의견만 있는 추이 기간(저스템 2028년), 영업이익 > 매출액(SK스퀘어), 서프라이즈 매출액이 위 표와 5% 넘게 다름,
+    기준 주가 ÷ EPS와 맞지 않는 PER(SK스퀘어), 추정치는 있는데 추정기관수 0곳(케이씨)을 한 종목에 모았다.
+    """
+    def cells(**values):
+        keys = ("SALES", "YOY", "OP", "NP", "EPS", "BPS", "PER", "PBR", "ROE", "EV")
+        return {"MAIN": "IFRS연결", **{k: "" for k in keys}, **values}
+
+    table = {"JsonData": [
+        cells(YYMM="2024.12(A)", SALES="1,000.0", OP="100.0", NP="80.0", EPS="800", BPS="10,000", PER="10.00"),
+        cells(YYMM="2025.12(A)", SALES="1,100.0", YOY="10.00", OP="120.0", NP="90.0", EPS="900", BPS="10,500",
+              PER="11.00"),
+        cells(YYMM="2026.12(E)", SALES="1,200.0", YOY="9.09", OP="1,500.0", NP="100.0", EPS="1,000", PER="10.00"),
+        cells(YYMM="2027.12(E)", SALES="1,300.0", YOY="8.33", OP="150.0", NP="125.0", EPS="1,250", PER="8.10"),
+        cells(YYMM="2028.12(E)")]}
+
+    def trend(sales):
+        return {"JsonData": [
+            {"ACC_NM": "투자의견(점수)", "DT": "20260923", **{f"VAL{n}": 4.0 for n in range(1, 6)}},
+            {"ACC_NM": "매출액(억원)", "DT": "20260923", **{f"VAL{n}": sales for n in range(1, 6)}}]}
+
+    surprise = {"tableData": {"tableHeaderData": [{"CNS_FY_2": "2023", "CNS_FY_1": "2024", "CNS_FY0": "2025"}],
+                              "tableData": [{"QTR": "연간실적(A)", "FY0": "2,000.0", "FY0_S": "2026/02/10"},
+                                            {"QTR": "발표직전(E)", "FY0": "1,900.0", "FY0_S": 5.26}]}}
+
+    def fake(url):
+        query = dict(urllib.parse.parse_qsl(url.split("?", 1)[-1]))
+        return {"2": table, "1": {"JsonData": [{"YYMM": "202612"}, {"YYMM": "202712"}, {"YYMM": "202812"}]},
+                "4": trend(None if query.get("yymm") == "202812" else 1200.0),
+                "5": surprise if query.get("acc_cd") == "121000" else {"tableData": {"tableData": []}}}[query["flag"]]
+
+    saved = server._fetch, server._analyst_count, server._regular_close_on
+    server._fetch, server._analyst_count, server._regular_close_on = fake, lambda code: (0, None), lambda code, d: 10000
+    try:
+        full, brief = server.stock_consensus("000000"), server.stock_consensus("000000", brief=True)
+    finally:
+        server._fetch, server._analyst_count, server._regular_close_on = saved
+    want = {
+        "추정기관수 0곳 → 기관 수 알 수 없음": "추정기관수: 0곳 — 최근 3개월 투자의견을 낸 증권사가 없어" in full,
+        "추정 없는 2028년 추이 빠짐": "2028.12(E) —" not in full and "2027.12(E) —" in full,
+        "영업이익 > 매출액 각주": "영업이익이 매출액보다 큰 기간이 있습니다(2026.12(E))" in full,
+        "서프라이즈 매출액 차이 각주": "5% 넘게 다릅니다(2025 2,000.0 vs 1,100.0" in full,
+        "기준 주가·불일치 각주": "정규장 종가 10,000원 기준입니다. 다만 이 종목은" in full and "(2027.12(E) PER 8.10" in full,
+        "자기 검산 통과": not note_problems(full)[0] and not note_problems(brief)[0],
+        "brief: 추이·서프라이즈·차이 각주 없음": "[컨센서스 추이]" not in brief and "[어닝서프라이즈]" not in brief
+                                             and "5% 넘게 다릅니다" not in brief and "영업이익이 매출액보다" in brief,
+    }
+    wrong = [k for k, v in want.items() if not v]
+    print(f"    {'ok  ' if not wrong else 'FAIL'} 가짜 응답 {len(want)}항목" + (f" — 어긋남: {wrong}" if wrong else ""))
+    if wrong:
+        problems.append(f"stock_consensus 가짜 응답 검사 실패: {wrong}")
 
 
 def check_financials():

@@ -18,13 +18,14 @@
   - stock_news           : 종목 관련 최신 뉴스
   - stock_investor_trend : 일별 투자자 수급 (외국인/기관/개인 순매수)
   - stock_financials     : 실적 추이 (분기/연간, 가장 가까운 1개 기간의 컨센서스 추정 포함)
-  - stock_consensus      : 컨센서스 (추정 3개 기간, 추정치 추이, 어닝서프라이즈)
-  - stock_compare        : 여러 종목 밸류에이션·수익성 비교 (스크리닝용, 최대 50종목)
+  - stock_consensus      : 컨센서스 (추정 3개 기간, 추정치 추이, 어닝서프라이즈, 추정기관수)
+  - stock_compare        : 여러 종목 밸류에이션·수익성 비교 (스크리닝용, 최대 50종목, 선행PER 3개년)
 """
 
 import html
 import json
 import os
+import re
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -40,6 +41,8 @@ NAVER_CHART_API = "https://api.stock.naver.com/chart/domestic/item"
 NAVER_SEARCH_API = "https://ac.stock.naver.com/ac"
 # 네이버 증권 종목분석 → 컨센서스 탭이 iframe으로 띄우는 WiseReport 페이지(데이터 FnGuide)의 JSON.
 WISEREPORT_CONSENSUS_API = "https://navercomp.wisereport.co.kr/v3/company/ajax/c1050001_data.aspx"
+# 같은 WiseReport의 기업현황 페이지(HTML). 추정기관수는 컨센서스 JSON엔 없고 이 페이지에만 있다.
+WISEREPORT_COMPANY_PAGE = "https://navercomp.wisereport.co.kr/v2/company/c1010001.aspx"
 KST = timezone(timedelta(hours=9))
 USER_AGENT = "Mozilla/5.0 (Macintosh; Apple Silicon) MCP-Korean-Stock/1.0"
 
@@ -539,6 +542,33 @@ def _why(data):
     return str(data.get("error"))[:80] if isinstance(data, dict) and "error" in data else "응답 형식이 다름"
 
 
+def _analyst_count(code):
+    """FnGuide 추정기관수 → (곳 수, None), 실패하면 (None, 이유).
+
+    기업현황 페이지의 '투자의견 컨센서스' 표 마지막 칸이다. 이름과 달리 연도별 EPS 추정 기관 수가 아니라 최근
+    3개월 안에 투자의견을 낸 증권사 수다 — 2026-09-27 시총 상위 173종목 모두 같은 페이지 '제공처별 투자의견'
+    표의 투자의견 있는 행 수와 같았다. 투자의견 없이 추정치만 낸 보고서는 세지 않아 케이씨·싸이맥스·케이엔제이는
+    추정치가 있는데 칸이 비어 있고, 투자의견이 하나도 없는 종목은 칸 대신 '의견이 없습니다' 행이 온다(에스티아이).
+    우선주 코드엔 보통주 페이지가 온다.
+    """
+    request = urllib.request.Request(f"{WISEREPORT_COMPANY_PAGE}?cmp_cd={code}", headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as resp:
+            page = resp.read().decode("utf-8", "replace")
+    except Exception as e:  # noqa: BLE001 - 실패 이유를 호출자에게 그대로 전달
+        return None, str(e)[:80]
+    start = page.find('id="cTB15"')
+    end = page.find("</table>", start)
+    cells = [re.sub(r"<[^>]+>|&nbsp;|\s", "", c) for c in re.findall(r"<td[^>]*>(.*?)</td>", page[start:end], re.S)] \
+        if 0 <= start < end else []
+    last = cells[-1] if cells else None
+    if last is not None and last.isdigit():
+        return int(last), None
+    if last == "" or (last and "의견이없습니다" in last):
+        return 0, None
+    return None, "응답 형식이 다름"
+
+
 def _negative(value):
     """표의 문자열('-14.34', '-4,199')이든 추이의 숫자(-14.337)든 음수인가."""
     number = value if isinstance(value, (int, float)) else _num(value or "-")
@@ -582,13 +612,16 @@ def _yoy_by_year(rows):
 
 
 @mcp.tool()
-def stock_consensus(code: str, period: str = "annual") -> str:
+def stock_consensus(code: str, period: str = "annual", brief: bool = False) -> str:
     """종목의 애널리스트 컨센서스(FnGuide)를 조회합니다 — 네이버 증권 종목분석 → 컨센서스 탭과 같은 데이터.
     period는 annual(연간, 기본) 또는 quarter(분기).
     ① 실적·추정 표: 최근 실적 4개 기간 + 추정 3개 기간(연간이면 예: 2026·2027·2028년) — 매출액·YoY·
        영업이익·순이익·EPS·BPS·PER·PBR·ROE·EV/EBITDA
     ② 컨센서스 추이: 추정 기간마다 기준일·1주·1개월·3개월·1년 전의 추정치(상향·하향 확인)
     ③ 어닝서프라이즈: 최근 3개 결산기의 실적과 발표 전 추정치(매출액·영업이익·순이익)
+    머리에 추정기관수(최근 3개월 안에 투자의견을 낸 증권사 수)를 적습니다.
+    brief=True면 ②·③을 빼고 ①과 필요한 각주만 돌려줍니다(종목당 약 1/3 분량) — 여러 종목의 추정치를 볼 때 쓰세요.
+    여러 종목의 선행PER(3개년) 비교는 stock_compare가 한 표로 줍니다.
     stock_financials의 추정은 가장 가까운 1개 기간뿐이라 그 뒤 추정은 이 도구로 보세요.
     목표주가·투자의견 평균은 stock_detail에 있습니다."""
     period_code = _PERIOD_MAP.get(period.upper(), period.lower())
@@ -612,11 +645,17 @@ def stock_consensus(code: str, period: str = "annual") -> str:
     listed_ok = isinstance(listed, dict) and "error" not in listed
     periods = [p["YYMM"] for p in (listed.get("JsonData") or []) if isinstance(p, dict)
                and p.get("YYMM") and p["YYMM"] > last_actual] if listed_ok else []
+    # brief는 추이를 싣지 않지만 기준일(추이 응답의 날짜)은 머리와 PER 기준 주가에 쓰므로 첫 기간만 받는다.
+    if brief:
+        periods = periods[:1]
     with ThreadPoolExecutor(max_workers=8) as pool:
+        count_job = pool.submit(_analyst_count, code)
         trend_jobs = [pool.submit(_fetch, _consensus_url(code, 4, frq, yymm=p)) for p in periods]
-        surprise_jobs = [pool.submit(_fetch, _consensus_url(code, 5, frq, acc_cd=acc)) for acc, _ in _CNS_SURPRISE]
+        surprise_jobs = [] if brief else [pool.submit(_fetch, _consensus_url(code, 5, frq, acc_cd=acc))
+                                          for acc, _ in _CNS_SURPRISE]
     trends = [job.result() for job in trend_jobs]
     surprises = [job.result() for job in surprise_jobs]
+    analysts, analysts_error = count_job.result()
 
     label = "연간" if frq == 0 else "분기"
     dates = [t["JsonData"][0].get("DT") for t in trends if isinstance(t, dict) and t.get("JsonData")]
@@ -627,6 +666,15 @@ def stock_consensus(code: str, period: str = "annual") -> str:
     bases = sorted({r.get("MAIN") for r in rows if r.get("MAIN")})
     if len(bases) == 1:
         lines.append(f"재무 기준: {bases[0]}")
+    estimates = [r for r in rows if "(E)" in r.get("YYMM", "")]
+    has_estimates = any(r.get(k) for r in estimates for k, _ in _CNS_COLUMNS)
+    # 추정치가 있는데 0곳이면 투자의견 없이 추정치만 낸 보고서에서 나온 것이다(케이씨: 1개월 안에 생긴 추정 하나).
+    if analysts_error:
+        lines.append(f"추정기관수: 조회 실패 ({analysts_error})")
+    elif analysts == 0 and has_estimates:
+        lines.append("추정기관수: 0곳 — 최근 3개월 투자의견을 낸 증권사가 없어, 이 추정치를 낸 기관 수는 알 수 없습니다")
+    else:
+        lines.append(f"추정기관수: {analysts}곳 (최근 3개월 투자의견 기준 — 각주)")
 
     lines += ["", "[실적·추정]", "| 기간 | " + " | ".join(n for _, n in _CNS_COLUMNS) + " |",
               "|" + "------|" * (len(_CNS_COLUMNS) + 1)]
@@ -650,18 +698,21 @@ def stock_consensus(code: str, period: str = "annual") -> str:
         if _negative(r.get("BPS")):
             cells[roe_at] = _labeled(cells[roe_at], "자본잠식")
         lines.append(f"| {r.get('YYMM', '')}{basis} | " + " | ".join(cells) + " |")
-    estimates = [r for r in rows if "(E)" in r.get("YYMM", "")]
-    if not any(r.get(k) for r in estimates for k, _ in _CNS_COLUMNS):
+    if not has_estimates:
         lines += ["", "현재 컨센서스 추정치가 없습니다."]
 
     trend_lines = []
-    for p, t in zip(periods, trends):
+    # brief는 추이를 싣지 않는다(첫 기간은 기준일을 알려고만 받았다).
+    for p, t in zip(periods, [] if brief else trends):
         name = f"{p[:4]}.{p[4:]}(E)"
         items = t.get("JsonData") if isinstance(t, dict) and "error" not in t else None
         if items is None:
             trend_lines += ["", f"{name} 조회 실패 ({_why(t)})"]
             continue
-        if all(_cns_number(i.get("VAL1"), "") == "-" for i in items):
+        # 투자의견(점수)은 기간과 상관없이 같은 종목 값이라(2026-09-27 12종목 모두 기간마다 같았다) 추정 유무를 볼 때
+        # 뺀다 — 빼지 않으면 추정이 없는 기간(저스템 2028년)이 투자의견 한 행짜리 표로 나왔다.
+        if all(_cns_number(i.get("VAL1"), "") == "-" for i in items
+               if not str(i.get("ACC_NM", "")).startswith("투자의견")):
             continue  # 기준일 추정치가 없는 기간
         trend_lines += ["", f"{name} — 기준일 {_fmt_yyyymmdd(items[0].get('DT'))}",
                         f"| 항목 | {_fmt_yyyymmdd(items[0].get('DT'))} | " + " | ".join(_CNS_TREND_COLUMNS) + " |",
@@ -685,7 +736,7 @@ def stock_consensus(code: str, period: str = "annual") -> str:
                         cells[n - 1], impaired = _labeled(cells[n - 1], "자본잠식"), True
             if any(c != "-" for c in cells):  # 분기 추이의 ROE처럼 전부 빈 항목은 뺀다
                 trend_lines.append(f"| {acc} | " + " | ".join(cells) + " |")
-    if not listed_ok:
+    if not listed_ok and not brief:
         trend_lines += ["", f"추이 기간 목록 조회 실패 ({_why(listed)})"]
     if trend_lines:
         lines += ["", "[컨센서스 추이] 기준일 추정치와 그 전 시점의 추정치 — 상향·하향 확인용"] + trend_lines
@@ -707,7 +758,11 @@ def stock_consensus(code: str, period: str = "annual") -> str:
     # LG에너지솔루션 2025/12 분기 영업이익 적자 −214 → −1,220이 +469%) ② 같은 칸의 발표직전 열은
     # (실적 − 추정) ÷ |추정|이다(56칸) ③ 발표직전 %가 표의 추정과 안 맞는다(9칸 — 삼성바이오로직스 2025
     # 매출액 실적 45,570 > 추정 44,363인데 −9.44%). 화면과 다른 칸은 ✎로 표시하고 ③은 화면 값을 남긴다.
-    surprise_lines, differ, flipped = [], [], False
+    # 매출액 실적이 위 표의 같은 결산기와 크게 다르면 두 표의 매출액이 다른 것이다 — SK스퀘어 2025는 서프라이즈
+    # 14,115.2억(DART 영업수익과 같다) vs 위 표 104,555.5억(영업수익 + 지분법이익 90,440.3억). 잠정치·확정치 차이는
+    # 대개 1% 안이다(2026-09-27 시총 상위 519종목 1,470칸 중 5% 넘는 칸 49개 — 재작성·분할·금융사 영업수익 등).
+    surprise_lines, differ, flipped, revenue_gaps = [], [], False, []
+    actual_rows = [r for r in rows if "(A)" in r.get("YYMM", "")]
     for key in _CNS_SURPRISE_KEYS:
         for account, header, actual, est in parsed:
             if not any(e.get(key) for e in est.values()):
@@ -715,6 +770,13 @@ def stock_consensus(code: str, period: str = "annual") -> str:
             period_name = header.get(f"CNS_{key}", key)
             date = actual.get(f"{key}_S")
             real = _num(actual.get(key) or "-")
+            if account == "매출액" and real:
+                # 결산기 이름은 연간 '2025', 분기 '2025/12' — 한 해에 실적 행이 둘인 6개월 결산은 짝을 못 정해 건너뛴다.
+                prefix = str(period_name).replace("/", ".")
+                same = [r for r in actual_rows if r["YYMM"].startswith(prefix)]
+                table_sales = _num(same[0].get("SALES") or "-") if len(same) == 1 else None
+                if table_sales and abs(table_sales / real - 1) > 0.05:
+                    revenue_gaps.append(f"{period_name} {actual.get(key)} vs {same[0]['SALES']}")
             cells = [(actual.get(key) or "-") + (f" ({date})" if actual.get(key) and date else "")]
             for head in heads:
                 e = est.get(head) or {}
@@ -758,19 +820,39 @@ def stock_consensus(code: str, period: str = "annual") -> str:
     if any(_negative(r.get("EV")) for r in rows):
         notes.append("EV/EBITDA가 음수인 칸은 EBITDA가 적자이거나 EV(시가총액 + 순차입금)가 음수(순현금이 시가총액보다 "
                      "큼)인 경우라, 배수로 비교하면 안 됩니다.")
-    # (E)의 PER은 기준일 정규장 종가 ÷ EPS(E)다 — 2026-09-23 삼성전자 285,500 ÷ 47,922 = 5.96(애프터마켓
-    # 종가 286,500이면 5.98). (A)는 결산기 말 종가다 — 2024년 53,200 ÷ 4,950 = 10.75, 2023년 78,500 ÷ 2,131 = 36.84.
+    # (E)의 PER·PBR은 기준일 정규장 종가 ÷ EPS·BPS다 — 2026-09-27 시총 상위 109종목 중 108개에서 추이의 PER × EPS가
+    # 분봉의 정규장 종가와 같았다(삼성전자 2026-09-23 285,500 ÷ 47,922 = 5.96, 애프터마켓 종가 286,500이면 5.98).
+    # 가격을 적어 두면 현재가로 계산하는 stock_compare와 왜 다른지 보인다. 기준일이 오늘이고 정규장이 안 끝났으면
+    # 분봉 마지막 값은 종가가 아니라 적지 않는다. (A)는 결산기 말 종가다 — 2024년 53,200 ÷ 4,950 = 10.75.
+    base_price, unmatched = None, ""
+    if dates and has_estimates:
+        now = datetime.now(KST)
+        if dates[0] < f"{now:%Y%m%d}" or f"{now:%H%M}" >= _regular_session_end(dates[0]):
+            base_price = _regular_close_on(code, dates[0])
+    # 나머지 한 종목 SK스퀘어는 (E) PER·PBR이 이 가격 ÷ EPS·BPS보다 1% 높다 — PER × 순이익 ÷ 주가로 역산한 주식 수
+    # (1억 3,332만 주)가 순이익 ÷ EPS의 주식 수(1억 3,198만 주)와 다르다(FnGuide 원본). 가격만 적으면 검산이 안 맞으니
+    # 그런 칸이 있으면 밝힌다. 허용 오차는 PER·PBR 소수 둘째 자리와 EPS·BPS 원 단위 반올림.
+    for r in estimates if base_price else []:
+        for multiple, per_share in (("PER", "EPS"), ("PBR", "BPS")):
+            shown, value = _num(r.get(multiple) or "-"), _num(r.get(per_share) or "-")
+            if shown is not None and value and not unmatched \
+                    and abs(shown - base_price / value) > 0.005 + base_price * 0.5 / value ** 2 + 1e-9:
+                unmatched = (f" 다만 이 종목은 (E) PER·PBR이 그 가격 ÷ EPS·BPS와 맞지 않습니다({r['YYMM']} {multiple} "
+                             f"{r[multiple]}, {base_price:,} ÷ {r[per_share]} = {base_price / value:.2f}) — FnGuide 원본 "
+                             "값을 그대로 두었습니다.")
+    price_basis = (f"기준일({_fmt_yyyymmdd(dates[0])}) 정규장 종가 {base_price:,}원" if base_price
+                   else "기준일 정규장 종가")
     if frq == 0:
-        notes.append("PER·PBR — (A)는 그 결산기 말 주가, (E)는 기준일 정규장 종가 기준입니다. "
-                     "현재가 기준 선행PER은 stock_compare를 쓰세요.")
+        notes.append(f"PER·PBR — (A)는 그 결산기 말 주가, (E)는 {price_basis} 기준입니다.{unmatched} "
+                     "stock_compare의 선행PER(3개년)은 조회 시점 현재가로 계산해, 가격이 이와 다르면 값도 다릅니다.")
     else:
         # 분기 값은 분기 하나로 계산한다 — 2026.09(E) PER 20.97 = 285,500 ÷ 분기 EPS 13,616,
         # 2026.06(A) ROE 13.72% = 분기 순이익 712,695억 ÷ 평균 지배주주 자본 5,195,148억.
         # stock_financials(모바일 API)의 분기 PER·ROE는 최근 4분기 합산이다 — 삼성전자 2026.06 PER이 여기 31.16,
         # 그쪽 14.98(334,000 ÷ 최근 4분기 EPS 22,358).
         notes.append("분기의 PER·ROE·EV/EBITDA는 그 분기 실적 하나로 계산한 값이라(연환산 아님) 연간 값과 "
-                     "비교하면 안 됩니다. (E)의 PER은 기준일 정규장 종가 기준입니다. stock_financials의 분기 PER·ROE는 "
-                     "최근 4분기 합산(TTM) 기준이라 이 표와 값이 다릅니다.")
+                     f"비교하면 안 됩니다. (E)의 PER·PBR은 {price_basis} 기준입니다.{unmatched} stock_financials의 "
+                     "분기 PER·ROE는 최근 4분기 합산(TTM) 기준이라 이 표와 값이 다릅니다.")
     if cycle:
         # 6개월 결산이면 PER = 결산기 말 종가 ÷ 6개월 EPS다 — 한화리츠 2026.04 5,970 ÷ 97 = 61.55(표 61.59).
         notes.append("결산 주기가 1년이 아닙니다(6개월 결산 리츠 등) — 표의 한 행이 한 결산기라 PER·ROE는 그 결산기 "
@@ -778,27 +860,53 @@ def stock_consensus(code: str, period: str = "annual") -> str:
                      "YoY엔 직전 결산기 대비가 섞여 있어 다른 칸은 ✎"
                      + (f"(화면 값: {', '.join(cycle[1])})" if cycle[1] else "")
                      + ", 1년 전 결산기가 표에 없는 행은 비웠습니다.")
-    # 삼성전자 2025 영업이익: 서프라이즈 실적 435,300억(2026/01/08 잠정 발표) vs 위 표 436,010.5억(확정).
-    notes.append("어닝서프라이즈의 실적은 발표일 당시 값이라(잠정실적을 내는 회사는 잠정치) 위 표의 확정치와 "
-                 "다를 수 있습니다.")
+    # 영업이익이 매출액보다 크면 두 값의 기준이 어긋난 것이다. SK스퀘어는 지분법이익을 영업이익에 넣는데, 실적(A)
+    # 매출액은 영업수익 + 지분법이익(2025: 14,115.2 + 90,440.3 = 104,555.5억, DART로 확인)이고 추정(E) 매출액은
+    # 영업이익보다 작아(2026E 130,986억 vs 496,238억) 지분법이익이 다 들어 있지 않다 — 그래서 2026E YoY 25.28%나 매출액
+    # 서프라이즈 −68.97%는 정의가 다른 값끼리 비교한 것이다(연간 (E)에선 2026-09-27 시총 상위 519종목 중 이 종목뿐).
+    # 삼성바이오로직스 분기 2025.12(A)는 분할 재작성의 흔적이다 — 매출액 3,085.7억 < 영업이익 3,780.8억, 서프라이즈의
+    # 그 분기 실적은 12,857.1억.
+    op_over = []
+    for r in rows:
+        sales, op = _num(r.get("SALES") or "-"), _num(r.get("OP") or "-")
+        if sales and sales > 0 and op is not None and op > sales:
+            op_over.append(r.get("YYMM", ""))
+    if op_over:
+        notes.append(f"영업이익이 매출액보다 큰 기간이 있습니다({', '.join(op_over)}) — 영업이익에 매출액 밖의 이익이 "
+                     "들어 있거나(지주·투자회사의 지분법이익 등) 실적이 재작성되며 기간끼리 기준이 달라진 경우라, 이 종목의 "
+                     "매출액·YoY·매출액 서프라이즈는 그대로 비교하지 마세요.")
+    if surprise_lines:
+        # 삼성전자 2025 영업이익: 서프라이즈 실적 435,300억(2026/01/08 잠정 발표) vs 위 표 436,010.5억(확정).
+        notes.append("어닝서프라이즈의 실적은 발표일 당시 값이라(잠정실적을 내는 회사는 잠정치) 위 표의 확정치와 "
+                     "다를 수 있습니다.")
+    if revenue_gaps:
+        notes.append(f"어닝서프라이즈 매출액 실적이 위 표 (A)와 5% 넘게 다릅니다({'; '.join(revenue_gaps)} — 서프라이즈 vs "
+                     "위 표). 잠정치가 크게 정정됐거나, 두 표의 매출액 정의가 다르거나(지주·투자회사의 지분법이익 포함 여부, "
+                     "금융사의 영업수익 범위 등), 위 표가 나중에 재작성된(중단영업·분할·연결 범위 변경) 경우입니다.")
     if flipped or differ:
         notes.append("✎ = 네이버 화면과 서프라이즈 %가 다른 칸."
                      + (" 추정이 음수(적자)인 칸의 발표직전 외 열은 화면이 실적 ÷ 추정 − 1로 계산해 부호가 반대입니다."
                         if flipped else "")
                      + (f" 발표직전 %가 표의 추정과 맞지 않는 칸의 화면 값: {', '.join(differ)}" if differ else ""))
+    if analysts is not None:
+        notes.append("추정기관수(FnGuide)는 최근 3개월 안에 투자의견을 낸 증권사 수입니다 — 연도별 기관 수가 아니고(먼 "
+                     "연도 추정일수록 더 적을 수 있음), 투자의견 없이 추정치만 낸 보고서는 세지 않습니다.")
+    if brief:
+        notes.append("brief=True라 컨센서스 추이·어닝서프라이즈는 뺐습니다(brief=False면 전체).")
     notes.append("목표주가·투자의견 평균은 stock_detail에 있습니다.")
     return "\n".join(lines) + "\n\n" + "\n".join(f"> {n}" for n in notes)
 
 
 # ── 멀티 종목 비교 ────────────────────────────────────────────────
 # 종목당 1회씩 부르면 호출 수가 종목 수만큼 늘고 컨텍스트도 그만큼 먹는다.
-# 스크리닝은 표 하나로 끝나야 하므로 시세는 한 요청으로, integration/finance는 종목별로 병렬로 받는다.
+# 스크리닝은 표 하나로 끝나야 하므로 시세는 한 요청으로, 종목 상세·실적·컨센서스·추정기관수는 종목별로 병렬로 받는다.
 _COMPARE_MAX = 50
 
 # 정렬 기준 열 → (결과 키, 높은 순인가). 밸류에이션 배수는 낮은 순, 규모·수익성은 높은 순.
 # 필터는 두지 않는다 — 행을 숨기면 조회 실패 행을 남기는 이유(누락을 알아채기)가 무너진다.
 _SORT_KEYS = {
-    "선행PER": ("fwd_per", False), "PER": ("per", False), "PBR": ("pbr", False),
+    "선행PER": ("fwd_per", False), "선행PER+1": ("fwd_per1", False), "선행PER+2": ("fwd_per2", False),
+    "PER": ("per", False), "PBR": ("pbr", False),
     "시총": ("cap_won", True), "ROE(E)": ("roe", True), "OPM추정": ("opm_est", True), "OPM확정": ("opm_fixed", True),
 }
 
@@ -870,8 +978,18 @@ def _compare_one(code, quote):
     """한 종목의 비교용 지표. 시세가 없어도(없는·상장폐지 코드) 행은 남겨 스크리닝에서 누락을 알아채게 한다."""
     if not quote:
         return {"code": code, "failed": True}
+    name = quote.get("stockName", code)
+    # 우선주는 네이버가 EPS·추정EPS·BPS를 보통주 값으로 준다(2026-09-23 삼성전자우·현대차2우B 등
+    # 10쌍 모두 일치). 응답에 우선주 표시가 없어 KRX 코드 규칙(보통주는 끝자리 0)과 이름의 '우'로
+    # 가린다 — 이름만 보면 우리금융지주·대우건설 같은 보통주가 걸린다.
+    preferred = not code.endswith("0") and "우" in name
+    # WiseReport 컨센서스는 우선주 코드엔 빈 목록이라 보통주 코드(앞 다섯 자리 + 0)로 받는다 — 선행PER처럼
+    # 우선주 현재가 ÷ 보통주 EPS가 된다. 추정기관수 페이지는 우선주 코드에도 보통주 값을 준다.
+    consensus_code = code[:5] + "0" if preferred else code
     integration = _fetch(f"{NAVER_STOCK_API}/stock/{code}/integration")
     finance = _fetch(f"{NAVER_STOCK_API}/stock/{code}/finance/annual")
+    consensus = _fetch(_consensus_url(consensus_code, 2, 0))
+    analysts, _ = _analyst_count(consensus_code)
 
     infos = {i["key"]: i["value"] for i in (integration.get("totalInfos") or [])} \
         if isinstance(integration, dict) else {}
@@ -897,16 +1015,21 @@ def _compare_one(code, quote):
     price_val, bps = _to_int(price), _to_int(_strip_unit(infos.get("BPS")))
     pbr = f"{price_val / bps:.2f}" if price_val and bps and bps > 0 else _strip_unit(infos.get("PBR"))
     cap_won = _to_int(quote.get("marketValueFull"))
-    name = quote.get("stockName", code)
+    # 선행PER+1·+2 = 현재가 ÷ 선행PER 다음 해·그다음 해 EPS(E). 모바일 API는 추정이 1개 기간뿐이라 stock_consensus와
+    # 같은 WiseReport 표에서 연도로 짝을 찾는다(첫 추정은 두 출처가 같은 컨센서스다). 조회 실패는 값 없음('-')과
+    # 가려 '?'로 둔다.
+    later = ["?", "?"]
+    wise_rows = consensus.get("JsonData") if isinstance(consensus, dict) and "error" not in consensus else None
+    if isinstance(wise_rows, list):
+        estimated = {r.get("YYMM", "")[:7]: r.get("EPS") for r in wise_rows if "(E)" in r.get("YYMM", "")}
+        base = (titles[est_idx].get("title", "")[:7] if est_idx is not None else "") or min(estimated, default="")
+        later = [_per(price, estimated.get(f"{int(base[:4]) + n}{base[4:]}")) if base else "-" for n in (1, 2)]
 
     return {
         "code": code,
         "failed": False,
         "name": name,
-        # 우선주는 네이버가 EPS·추정EPS·BPS를 보통주 값으로 준다(2026-09-23 삼성전자우·현대차2우B 등
-        # 10쌍 모두 일치). 응답에 우선주 표시가 없어 KRX 코드 규칙(보통주는 끝자리 0)과 이름의 '우'로
-        # 가린다 — 이름만 보면 우리금융지주·대우건설 같은 보통주가 걸린다.
-        "preferred": not code.endswith("0") and "우" in name,
+        "preferred": preferred,
         "price": price,
         "basis": _price_basis(quote),
         "traded": _fmt_traded(quote.get("localTradedAt")),
@@ -914,7 +1037,10 @@ def _compare_one(code, quote):
         "cap_won": cap_won,
         "per": per,
         "fwd_per": fwd_per,
+        "fwd_per1": later[0],
+        "fwd_per2": later[1],
         "fwd_eps": fwd_eps,
+        "analysts": "?" if analysts is None else str(analysts),
         # 선행PER이 숫자가 아니면(적자·값 없음) `*`를 달지 않는다.
         "fallback": fallback and fwd_per != "-" and not fwd_per.startswith("적자"),
         "pbr": pbr,
@@ -932,10 +1058,11 @@ def stock_compare(codes: str, sort_by: str = "") -> str:
 
     종목마다 stock_detail/stock_financials를 따로 부르는 대신 한 번에 받아옵니다.
     codes: 종목코드를 콤마로 구분 (예: "005930,000660,058470"). 최대 50개, 같은 코드는 한 번만 조회합니다.
-    sort_by: 정렬 기준 열 (선택). 선행PER·PER·PBR은 낮은 순, 시총·ROE(E)·OPM추정·OPM확정은 높은 순이고
-        적자·값 없음은 맨 아래로 갑니다. 비우면 입력 순서.
-    반환 항목: 현재가·시총·PER·선행PER·EPS(E)·PBR·영업이익률(최근 확정/추정)·ROE(E).
-    시총·PER·선행PER·PBR은 모두 표의 현재가로 계산합니다(PER = 현재가 ÷ EPS, 선행PER = 현재가 ÷ EPS(E)).
+    sort_by: 정렬 기준 열 (선택). 선행PER·선행PER+1·선행PER+2·PER·PBR은 낮은 순, 시총·ROE(E)·OPM추정·OPM확정은
+        높은 순이고 적자·값 없음은 맨 아래로 갑니다. 비우면 입력 순서.
+    반환 항목: 현재가·시총·PER·선행PER·EPS(E)·선행PER+1·선행PER+2(그다음 두 해 추정 EPS 기준)·PBR·
+        영업이익률(최근 확정/추정)·ROE(E)·기관수(FnGuide 추정기관수 — 최근 3개월 투자의견을 낸 증권사 수).
+    시총·PER·선행PER 3개·PBR은 모두 표의 현재가로 계산합니다(PER = 현재가 ÷ EPS, 선행PER = 현재가 ÷ EPS(E)).
     표 위에 현재가 기준(정규장 실시간 / 애프터마켓 / 장 마감)과 조회 시각을 표시합니다.
     PER·선행PER은 적자면 '적자(계산값)', 값이 없으면 '-'. 우선주(†)는 EPS·BPS가 보통주 값이라 배수가 낮게 나옵니다.
     """
@@ -987,25 +1114,26 @@ def stock_compare(codes: str, sort_by: str = "") -> str:
         lines.append(f"정렬: {sort} {'높은' if _SORT_KEYS[sort][1] else '낮은'} 순 — 적자·값 없음·조회 실패는 맨 아래")
     lines += [
         "",
-        "| 종목 | 현재가 | 시총 | PER | 선행PER | EPS(E) | PBR | OPM확정 | OPM추정 | ROE(E) |",
-        "|------|------|------|------|------|------|------|------|------|------|",
+        "| 종목 | 현재가 | 시총 | PER | 선행PER | EPS(E) | 선행PER+1 | 선행PER+2 | PBR | OPM확정 | OPM추정 | ROE(E) | 기관수 |",
+        "|" + "------|" * 13,
     ]
     for r in results:
         if r["failed"]:
-            lines.append(f"| ({r['code']}) 조회 실패 | - | - | - | - | - | - | - | - | - |")
+            lines.append(f"| ({r['code']}) 조회 실패 |" + " - |" * 12)
             continue
         mark = "*" if r["fallback"] else ""
         pref = "†" if r["preferred"] else ""
         lines.append(
             f"| {r['name']}{pref} ({r['code']}) | {r['price']} | {r['cap']} | {r['per']} | "
-            f"{r['fwd_per']}{mark} | {r['fwd_eps']} | {r['pbr']} | {r['opm_fixed']} | {r['opm_est']} | {r['roe']} |"
+            f"{r['fwd_per']}{mark} | {r['fwd_eps']} | {r['fwd_per1']} | {r['fwd_per2']} | {r['pbr']} | "
+            f"{r['opm_fixed']} | {r['opm_est']} | {r['roe']} | {r['analysts']} |"
         )
 
     notes = [
-        "단위 — 현재가·EPS(E): 원, PER·PBR: 배, OPM·ROE: %. 시총·PER·선행PER·PBR은 모두 표의 "
+        "단위 — 현재가·EPS(E): 원, PER·PBR: 배, OPM·ROE: %, 기관수: 곳. 시총·PER·선행PER 3개·PBR은 모두 표의 "
         "현재가로 계산했습니다(선행PER = 현재가 ÷ EPS(E)). PER·선행PER은 적자면 `적자`, 값이 없으면 `-`입니다."
     ]
-    if any(str(r.get(key, "")).startswith("적자(") for r in ok for key in ("per", "fwd_per")):
+    if any(str(r.get(key, "")).startswith("적자(") for r in ok for key in ("per", "fwd_per", "fwd_per1", "fwd_per2")):
         notes.append("`적자(…)`의 괄호 값은 현재가 ÷ EPS 계산값을 남긴 것뿐입니다 — 음수 PER은 크기가 적자 규모에 "
                      "반비례하고 주가 변동도 섞여서, 그 크기나 변화로 적자폭을 판단하면 거꾸로 읽힙니다. "
                      "적자폭은 `EPS(E)`로 보세요. 정렬에선 적자 행이 맨 아래로 갑니다.")
@@ -1013,16 +1141,29 @@ def stock_compare(codes: str, sort_by: str = "") -> str:
     fixed_labels = {r["fixed_label"] for r in ok if r["fixed_label"]}
     est_labels = {r["est_label"] for r in ok if r["est_label"]}
     if len(fixed_labels) == 1 and len(est_labels) == 1:
+        est = est_labels.pop()
         notes.append(
-            f"`OPM확정`은 {fixed_labels.pop()} 확정치, `OPM추정`·`EPS(E)`·`ROE(E)`는 {est_labels.pop()} "
-            "**컨센서스 추정치**입니다. 확정치와 섞어 인용하지 마세요."
+            f"`OPM확정`은 {fixed_labels.pop()} 확정치, `OPM추정`·`EPS(E)`·`ROE(E)`는 {est} **컨센서스 추정치**, "
+            f"`선행PER+1`·`선행PER+2`는 {int(est[:4]) + 1}{est[4:]}·{int(est[:4]) + 2}{est[4:]} 추정 EPS 기준입니다. "
+            "확정치와 섞어 인용하지 마세요."
         )
     else:
         notes.append(
             "**결산기가 다른 종목이 섞여 있습니다** — `OPM확정`/`OPM추정`의 기준 연도가 종목마다 다르므로, "
             "비교 전에 stock_financials로 각 종목의 기준 연도를 확인하세요. "
-            "`OPM추정`·`EPS(E)`·`ROE(E)`는 컨센서스 추정치입니다."
+            "`OPM추정`·`EPS(E)`·`ROE(E)`는 컨센서스 추정치이고, `선행PER+1`·`선행PER+2`는 각 종목 `EPS(E)` 연도의 "
+            "다음 해·그다음 해 추정 EPS 기준입니다."
         )
+    # 선행PER+1·+2의 EPS는 stock_consensus 표와 같은 값인데 그 표의 PER(E)는 기준일 정규장 종가 기준이라, 애프터마켓이나
+    # 다음 날 장중엔 값이 갈린다(삼성전자 2027E: 285,500 ÷ 68,682 = 4.16 vs 현재가 286,500이면 4.17 — 2026-09-27 리뷰).
+    notes.append("`선행PER+1`·`선행PER+2`의 EPS는 stock_consensus 표와 같은 FnGuide 추정치입니다. 그 표의 PER(E)는 "
+                 "기준일 정규장 종가로 계산돼 있어 현재가가 그 가격과 다르면 값이 다릅니다.")
+    notes.append("`기관수`는 FnGuide 추정기관수로, 최근 3개월 안에 투자의견을 낸 증권사 수입니다 — 연도별 기관 수가 "
+                 "아니고(먼 연도 추정일수록 더 적을 수 있음) 투자의견 없이 추정치만 낸 보고서는 세지 않아, 0이어도 "
+                 "추정치가 있을 수 있습니다.")
+    unknown = [r["code"] for r in ok if "?" in (r["fwd_per1"], r["fwd_per2"], r["analysts"])]
+    if unknown:
+        notes.append(f"`?` = WiseReport(FnGuide) 조회 실패 — 잠시 뒤 다시 조회하세요: {', '.join(unknown)}")
 
     if any(r["fallback"] for r in ok):
         notes.append(
@@ -1032,8 +1173,8 @@ def stock_compare(codes: str, sort_by: str = "") -> str:
 
     if any(r["preferred"] for r in ok):
         notes.append(
-            "`†` 표시는 **우선주**입니다. EPS·EPS(E)·BPS가 보통주 값이라(네이버도 같은 방식) PER·선행PER·PBR에 "
-            "우선주 할인이 들어가 낮게 나옵니다. 보통주나 다른 종목과 배수를 그대로 비교하지 마세요."
+            "`†` 표시는 **우선주**입니다. EPS·EPS(E)·BPS가 보통주 값이라(네이버도 같은 방식) PER·선행PER 3개·PBR에 "
+            "우선주 할인이 들어가 낮게 나옵니다(기관수도 보통주 값). 보통주나 다른 종목과 배수를 그대로 비교하지 마세요."
         )
 
     notes.append(

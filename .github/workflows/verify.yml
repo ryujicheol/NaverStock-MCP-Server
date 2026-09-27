@@ -12,6 +12,9 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    # 기본 제한은 6시간이다. WiseReport가 러너 IP에서 응답을 멈추면 요청마다 타임아웃까지 기다려 길어진다
+    # (2026-09-27 12분, 검사 34개를 건너뜀).
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

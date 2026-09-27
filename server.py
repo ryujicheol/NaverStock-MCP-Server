@@ -1154,6 +1154,13 @@ def stock_compare(codes: str, sort_by: str = "") -> str:
             "`OPM추정`·`EPS(E)`·`ROE(E)`는 컨센서스 추정치이고, `선행PER+1`·`선행PER+2`는 각 종목 `EPS(E)` 연도의 "
             "다음 해·그다음 해 추정 EPS 기준입니다."
         )
+    # 영업이익률이 100%를 넘으면 영업이익이 매출액보다 크다 — SK스퀘어 2026E 378.85%(영업이익 49.6조 vs 매출액 13.1조):
+    # 지분법이익이 영업이익엔 들어 있는데 추정 매출액엔 다 들어 있지 않다(stock_consensus 각주와 같은 원인).
+    over = [r["name"] for r in ok if any((_num(r[key]) or 0) > 100 for key in ("opm_fixed", "opm_est"))]
+    if over:
+        notes.append(f"`OPM확정`·`OPM추정`이 100%를 넘는 종목({', '.join(over)})은 영업이익이 매출액보다 큽니다 — 영업이익에 "
+                     "매출액 밖의 이익이 들어 있거나(지주·투자회사의 지분법이익 등) 실적이 재작성되며 기준이 어긋난 경우라, "
+                     "OPM을 다른 종목과 비교하지 마세요.")
     # 선행PER+1·+2의 EPS는 stock_consensus 표와 같은 값인데 그 표의 PER(E)는 기준일 정규장 종가 기준이라, 애프터마켓이나
     # 다음 날 장중엔 값이 갈린다(삼성전자 2027E: 285,500 ÷ 68,682 = 4.16 vs 현재가 286,500이면 4.17 — 2026-09-27 리뷰).
     notes.append("`선행PER+1`·`선행PER+2`의 EPS는 stock_consensus 표와 같은 FnGuide 추정치입니다. 그 표의 PER(E)는 "

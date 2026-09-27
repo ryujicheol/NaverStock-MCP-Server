@@ -22,7 +22,8 @@ import types
 import urllib.parse
 import urllib.request
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+# 줄마다 내보낸다 — CI가 제한 시간(20분)에 끊겨도 어디까지 돌았는지 로그에 남는다(버퍼에 남은 출력은 사라진다).
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
 
 
 class _StubFastMCP:
@@ -385,6 +386,21 @@ def check_compare_table():
               f"첫 추정 연도 짝 {aligned}행 확인")
     if not count_off and count_cells:
         print(f"    ok   기관수 = 최근 3개월 투자의견을 낸 증권사 수 — {count_cells}행 일치")
+    opm_note_problem(markdown, "stock_compare 검사 표")
+
+
+def opm_note_problem(markdown, label):
+    """OPM확정·OPM추정이 100%를 넘는 행이 있으면 그 종목 이름이 각주에 있어야 하고, 없으면 각주도 없어야 한다."""
+    lines = [l for l in markdown.split("\n") if l.startswith("|")]
+    header = [c.strip() for c in lines[0].strip("|").split("|")]
+    over = [r[0].split(" (")[0].rstrip("†") for r in ([c.strip() for c in l.strip("|").split("|")] for l in lines[2:])
+            if len(r) == len(header) and any((_float(r[header.index(k)]) or 0) > 100 for k in ("OPM확정", "OPM추정"))]
+    note = re.search(r"100%를 넘는 종목\(([^)]*)\)", markdown)
+    if (note.group(1).split(", ") if note else []) != over:
+        print(f"    FAIL {label} OPM 100% 초과 각주 {note and note.group(1)} ≠ 해당 행 {over}")
+        problems.append(f"{label}: OPM 100% 초과 각주가 해당 행과 다르다")
+        return True
+    return False
 
 
 def check_compare_sort():
@@ -521,6 +537,30 @@ def check_edges():
     print(f"    {'ok  ' if ok else 'FAIL'} 선행PER+1·+2·기관수 — 연도 짝·적자·추정 없음 {got[0]}, 조회 실패 {got[1]}")
     if not ok:
         problems.append(f"stock_compare 선행PER+1·+2·기관수 표시가 어긋났다: {got}")
+
+    # OPM이 100%를 넘는 행(SK스퀘어 2026E 378.85% — 지분법이익이 영업이익에만 들어 있다)엔 각주가 붙어야 한다. 지금은
+    # 519종목 중 이 종목뿐이라(2026-09-27) 가짜 응답으로 본다 — 가짜1은 OPM추정 150%, 가짜2는 20%.
+    def fake_finance(url):
+        if not url.endswith("/finance/annual"):
+            return {}
+        opm = "150.00" if "/000001/" in url else "20.00"
+        return {"financeInfo": {
+            "trTitleList": [{"key": "202512", "title": "2025.12.", "isConsensus": "N"},
+                            {"key": "202612", "title": "2026.12.", "isConsensus": "Y"}],
+            "rowList": [{"title": "영업이익률", "columns": {"202512": {"value": "10.00"}, "202612": {"value": opm}}}]}}
+
+    saved = server._fetch, server._fetch_quotes, server._analyst_count
+    server._fetch, server._analyst_count = fake_finance, lambda code: (1, None)
+    server._fetch_quotes = lambda codes: ({c: {"closePrice": "10,000", "stockName": f"가짜{c[-1]}"} for c in codes}, "")
+    try:
+        output = server.stock_compare("000001,000002")
+    finally:
+        server._fetch, server._fetch_quotes, server._analyst_count = saved
+    if "100%를 넘는 종목(가짜1)" in output and not opm_note_problem(output, "가짜 응답"):
+        print("    ok   OPM 100% 초과 행에만 각주 (가짜 응답)")
+    elif "100%를 넘는 종목(가짜1)" not in output:
+        print("    FAIL OPM 100% 초과 행(가짜1)에 각주가 없다")
+        problems.append("stock_compare OPM 100% 초과 각주가 없다")
 
     # 우선주는 EPS·BPS가 보통주 값이라 배수가 낮게 나온다 — 행에 †와 주석이 붙어야 한다
     # (2026-09-23 리뷰). 주석의 전제(보통주 값과 같다)도 함께 본다. 네이버가 우선주 자체 EPS를

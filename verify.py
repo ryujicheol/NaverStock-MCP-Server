@@ -335,6 +335,19 @@ def check_compare_table():
     # 모바일 API 추정 열의 연도로 짝을 찾는다. 전제: 그 연도의 WiseReport EPS = 표의 EPS(E)(같은 컨센서스, 1원 반올림 차).
     # 기관수는 '제공처별 투자의견' 표의 투자의견 있는 행 수와 같아야 한다.
     later_cells = later_off = aligned = count_cells = count_off = 0
+    # 도구 쪽 WiseReport 조회가 실패한 칸은 '?'가 맞는 출력이다(러너 IP에선 자주 끊긴다) — 값 대조는 건너뛰고, 그 코드가
+    # '?' 각주에 있는지만 본다.
+    unknown = [code for r, code in zip(valid, codes) if "?" in (r[col["선행PER+1"]], r[col["선행PER+2"]], r[col["기관수"]])]
+    unknown_note = next((l for l in markdown.split("\n") if l.startswith("> `?` =")), "")
+    if unknown:
+        missing = [code for code in unknown if code not in unknown_note]
+        print(f"    {'warn' if not missing else 'FAIL'} 도구의 WiseReport 조회 실패로 `?` 칸이 있는 {len(unknown)}행은 값 대조를 "
+              f"건너뜀" + (f" — `?` 각주에 없는 코드 {missing}" if missing else ""))
+        if missing:
+            problems.append(f"stock_compare `?` 각주에 조회 실패 코드가 빠졌다: {missing}")
+    elif unknown_note:
+        print(f"    FAIL `?` 칸이 없는데 `?` 각주가 있다: {unknown_note[:60]}")
+        problems.append("stock_compare `?` 각주가 칸과 어긋났다")
     for r, code in zip(valid, codes):
         price = server._to_int(r[col["현재가"]])
         base_code = code[:5] + "0" if "†" in r[0] else code
@@ -358,6 +371,8 @@ def check_compare_table():
         for n, label in ((1, "선행PER+1"), (2, "선행PER+2")):
             eps = server._to_int(estimated.get(f"{int(base[:4]) + n}{base[4:]}")) if base else None
             got = r[col[label]]
+            if got == "?":
+                continue  # 도구의 조회 실패 — 위에서 각주만 확인했다
             if not price or not eps:
                 same = got == "-"
                 want = "-"
@@ -372,6 +387,8 @@ def check_compare_table():
                 later_off += 1
                 print(f"    FAIL {label} {r[0]}: 표 {got} ≠ 현재가 {price:,} ÷ {base} 다음 {n}년 EPS {eps} = {want}")
                 problems.append(f"stock_compare {label}이 현재가 ÷ 그 해 EPS(E)가 아니다: {r[0]}")
+        if r[col["기관수"]] == "?":
+            continue
         rows_with_opinion = opinion_rows(base_code)
         if rows_with_opinion is None:
             print(f"    warn {r[0]} 제공처별 투자의견 표 조회 실패 — 기관수 대조 건너뜀")
@@ -582,6 +599,8 @@ def check_edges():
     if pref is None or common is None:
         print("    FAIL 우선주 비교 표에 삼성전자·삼성전자우 행이 없다")
         problems.append("stock_compare 우선주 비교 표가 어긋났다")
+    elif "?" in [row[col[label]] for row in (pref, common) for label in ("선행PER+1", "선행PER+2", "기관수")]:
+        print("    warn 우선주 선행PER+1·+2 대조 건너뜀 — 도구의 WiseReport 조회 실패(`?`)")
     else:
         ratio = server._to_int(pref[col["현재가"]]) / server._to_int(common[col["현재가"]])
         pairs = [(_float(pref[col[label]]), _float(common[col[label]])) for label in ("선행PER+1", "선행PER+2")]
@@ -700,9 +719,10 @@ def loss_label_problems(sections):
 
 # WiseReport가 응답을 멈추거나 막는 실패 — GitHub 러너 IP에서 가끔 난다(2026-09-25 CI 5회 중 2회, 전부
 # 타임아웃. 로컬·Render에선 재현 안 됨). 우리 코드 문제가 아니라 경고로 건너뛴다. 404·형식 오류는 주소나
-# 응답 형식이 바뀐 것일 수 있어 그대로 FAIL이다.
+# 응답 형식이 바뀐 것일 수 있어 그대로 FAIL이다. 2026-09-27 CI에선 연결을 도중에 끊는 SSL 오류(`[SSL:
+# UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol`)도 나왔다 — 다시 불러도 같았다.
 EXTERNAL = ("timed out", "HTTP Error 403", "HTTP Error 429", "HTTP Error 5", "Connection reset", "10054",
-            "Remote end closed")
+            "Remote end closed", "UNEXPECTED_EOF", "EOF occurred")
 skipped = []
 
 
@@ -817,18 +837,27 @@ def check_consensus():
             sections = consensus_tables(output)
             # 추정기관수 = 제공처별 투자의견 표의 투자의견 수. (E) PER·PBR = 각주의 기준일 정규장 종가 ÷ EPS·BPS —
             # 이 세 종목은 맞아야 한다(전제: 2026-09-27 109종목 중 108개. 어긋나면 FnGuide 계산이 바뀐 것이니 각주를 볼 것).
+            # 도구나 이 검사의 페이지 조회가 외부 장애로 실패하면(러너 IP) 대조만 건너뛴다. 형식 오류 같은 실패는 FAIL.
             count = re.search(r"^추정기관수: (\d+)곳", output, re.M)
-            if rows_with_opinion is not None and (count is None or int(count.group(1)) != rows_with_opinion):
-                print(f"    FAIL {tag} 추정기관수 {count and count.group(1)} ≠ 투자의견 낸 증권사 {rows_with_opinion}곳")
-                problems.append(f"stock_consensus({tag}) 추정기관수가 최근 3개월 투자의견 수와 다르다")
+            lookup = re.search(r"^추정기관수: 조회 실패 \((.*)\)$", output, re.M)
+            counted = "추정기관수 대조 건너뜀(WiseReport 조회 실패)"
+            if not (lookup and external_failure(lookup.group(1))) and rows_with_opinion is not None:
+                counted = f"추정기관수 {rows_with_opinion}곳 일치"
+                if count is None or int(count.group(1)) != rows_with_opinion:
+                    print(f"    FAIL {tag} 추정기관수 {count.group(1) if count else lookup and lookup.group(0)} "
+                          f"≠ 투자의견 낸 증권사 {rows_with_opinion}곳")
+                    problems.append(f"stock_consensus({tag}) 추정기관수가 최근 3개월 투자의견 수와 다르다")
             issues, priced = note_problems(output)
-            if "맞지 않습니다" in output or not priced:
+            # 기준 주가는 추이 응답의 기준일로 받는다 — 추이가 외부 장애로 다 빠지면 가격을 못 적으니 검산만 건너뛴다.
+            if not priced and external_failure(output):
+                print(f"    warn {tag} 기준 주가 검산 건너뜀 — 추이 조회 실패로 기준일을 모름")
+            elif "맞지 않습니다" in output or not priced:
                 issues.append(f"(E) PER·PBR이 기준일 정규장 종가 ÷ EPS·BPS로 검산되지 않는다(검산 {priced}칸)")
             if issues:
                 print(f"    FAIL {tag} {issues[:3]}")
                 problems.append(f"stock_consensus({tag}) 각주·검산이 어긋났다")
             else:
-                print(f"    ok   {tag} 추정기관수 {rows_with_opinion}곳 일치, (E) PER·PBR = 기준 주가 ÷ EPS·BPS {priced}칸")
+                print(f"    ok   {tag} {counted}, (E) PER·PBR = 기준 주가 ÷ EPS·BPS {priced}칸")
             # 분기 각주(연환산 아님)는 분기 표에만 붙어야 한다 — 연간 표에 붙은 회귀가 있었다(if/else 어긋남).
             if ("분기의 PER·ROE·EV/EBITDA" in output) != (period == "quarter"):
                 print(f"    FAIL {tag} 분기 각주가 {'없다' if period == 'quarter' else '연간 표에 붙었다'}")
@@ -1094,10 +1123,15 @@ def check_consensus():
     if not (skip_if_external("삼성전자 전체", full) or skip_if_external("삼성전자 brief", brief)):
         same = consensus_tables(full).get("실적·추정") == consensus_tables(brief).get("실적·추정")
         extra = [s for s in ("[컨센서스 추이]", "[어닝서프라이즈]") if s in brief]
-        head = [l for l in full.split("\n") if l.startswith(("종목", "추정기관수"))] == \
-               [l for l in brief.split("\n") if l.startswith(("종목", "추정기관수"))]
-        ok = same and not extra and head and "brief=True라" in brief and len(brief) < len(full) * 0.45
-        print(f"    {'ok  ' if ok else 'FAIL'} brief — 표·머리 같음 {same and head}, 뺀 섹션 남음 {extra}, "
+        # 추정기관수 줄은 두 호출 중 하나라도 외부 장애로 조회에 실패했으면 비교에서 뺀다(러너 IP). 전체 출력의 추이·
+        # 서프라이즈가 조회 실패로 빠졌으면 분량 비교도 뜻이 없다.
+        keep = not any(l.startswith("추정기관수: 조회 실패") and external_failure(l)
+                       for text in (full, brief) for l in text.split("\n"))
+        head = [[l for l in text.split("\n") if l.startswith("종목") or (keep and l.startswith("추정기관수"))]
+                for text in (full, brief)]
+        shorter = len(brief) < len(full) * 0.45 or "조회 실패" in full
+        ok = same and not extra and head[0] == head[1] and "brief=True라" in brief and shorter
+        print(f"    {'ok  ' if ok else 'FAIL'} brief — 표·머리 같음 {same and head[0] == head[1]}, 뺀 섹션 남음 {extra}, "
               f"{len(brief):,}자 / 전체 {len(full):,}자")
         if not ok:
             problems.append("stock_consensus brief 출력이 어긋났다")

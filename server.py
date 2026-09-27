@@ -986,10 +986,14 @@ def _compare_one(code, quote):
     # WiseReport 컨센서스는 우선주 코드엔 빈 목록이라 보통주 코드(앞 다섯 자리 + 0)로 받는다 — 선행PER처럼
     # 우선주 현재가 ÷ 보통주 EPS가 된다. 추정기관수 페이지는 우선주 코드에도 보통주 값을 준다.
     consensus_code = code[:5] + "0" if preferred else code
-    integration = _fetch(f"{NAVER_STOCK_API}/stock/{code}/integration")
-    finance = _fetch(f"{NAVER_STOCK_API}/stock/{code}/finance/annual")
-    consensus = _fetch(_consensus_url(consensus_code, 2, 0))
-    analysts, _ = _analyst_count(consensus_code)
+    # 요청 4개를 동시에 보낸다 — Render(미국)에서 한국 서버까지 요청 하나가 약 1초라, 차례로 보내면 50종목이
+    # 26초 걸렸다(2026-09-27, 8종목씩 7바퀴 × 바퀴당 약 3.5초).
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        jobs = [pool.submit(_fetch, f"{NAVER_STOCK_API}/stock/{code}/integration"),
+                pool.submit(_fetch, f"{NAVER_STOCK_API}/stock/{code}/finance/annual"),
+                pool.submit(_fetch, _consensus_url(consensus_code, 2, 0)),
+                pool.submit(_analyst_count, consensus_code)]
+    integration, finance, consensus, (analysts, _) = (job.result() for job in jobs)
 
     infos = {i["key"]: i["value"] for i in (integration.get("totalInfos") or [])} \
         if isinstance(integration, dict) else {}

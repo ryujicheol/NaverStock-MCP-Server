@@ -162,14 +162,19 @@ def _regular_session_end(date):
 
 
 def _regular_close_on(code, date):
-    """그날 정규장 종가(정수). 분봉은 KRX 단독이라 정규장 마감 시각 이하 마지막 봉이 정규장 종가다.
+    """그날 정규장 종가(정수), 모르면 None. 분봉은 KRX 단독이라 종가 단일가 봉(마감 시각 이후 첫 봉)이 정규장 종가다.
 
     현재가·일봉 종가는 애프터마켓 종가라 쓸 수 없다. 2026-09-23 삼성전자 285,500원·SK하이닉스
     1,862,000원으로 뉴스의 정규장 종가와 일치했다(현재가는 286,500원·1,863,000원).
+    종가 단일가가 연장되는 날(VI)은 그 봉이 15:32에 찍힌다 — 2026-11-09~13 60종목 360건 중 6건(삼성생명 11/09:
+    15:19 240,500원 다음 15:32 237,000원 = 다음 날 기준가). 마감 시각까지만 받으면 15:19 가격을 종가로 썼다
+    (2026-10-12 CI의 삼성전자 10/08 264,500원 vs 기준가 262,000원도 이것으로 보인다). 그래서 장후 시간외 종가(15:40~)가
+    시작되기 전(마감 + 9분)까지 받고, 마지막 봉이 마감 시각보다 이르면(연장 중이라 아직 체결 전 등) 모른다고 본다.
     """
     end = _regular_session_end(date)
-    bars = _fetch(f"{NAVER_CHART_API}/{code}/minute?startDateTime={date}0900&endDateTime={date}{end}")
-    if not isinstance(bars, list) or not bars:
+    limit = f"{end[:2]}{int(end[2:]) + 9:02d}"
+    bars = _fetch(f"{NAVER_CHART_API}/{code}/minute?startDateTime={date}0900&endDateTime={date}{limit}")
+    if not isinstance(bars, list) or not bars or str(bars[-1].get("localDateTime", ""))[8:12] < end:
         return None
     price = bars[-1].get("currentPrice")
     return int(price) if isinstance(price, (int, float)) else None

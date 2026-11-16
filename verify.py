@@ -14,6 +14,7 @@
 사용법:
     python verify.py
 """
+import calendar
 import io
 import json
 import re
@@ -101,11 +102,13 @@ def fetch(url):
 
 
 def opinion_rows(code):
-    """기업현황 페이지 '제공처별 투자의견' 표에서 투자의견이 있는 행 수, 실패하면 None.
+    """기업현황 페이지 '제공처별 투자의견' 표에서 도구의 추정기관수와 같은 기간으로 센 투자의견 수, 실패하면 None.
 
     도구의 추정기관수는 같은 페이지의 '투자의견 컨센서스' 표에서 읽는다. 다른 표로 세어 맞춰 보면 파싱과 함께
     '최근 3개월 투자의견을 낸 증권사 수'라는 각주의 전제(2026-09-27 시총 상위 173종목 모두 같았다)도 확인된다.
-    투자의견이 하나도 없으면 '의견이 없습니다' 한 칸짜리 행만 있어 0이다.
+    두 표는 3개월 경계일을 다르게 다룬다 — 제공처별 표(증권사마다 최종일자 1행)는 컨센서스 기준일 − 3개월 당일의
+    보고서를 넣고 컨센서스는 뺀다. 2026-11-16 400종목: 기준일 11/13에 '8/13 행만 뺀다'가 숫자 있는 270종목 중 268종목을
+    맞혔다(10/05·11/02 CI FAIL의 원인). 그래서 그다음 날부터 센다. 투자의견이 없으면 '의견이 없습니다' 한 칸 행만 있어 0이다.
     """
     try:
         request = urllib.request.Request(f"{server.WISEREPORT_COMPANY_PAGE}?cmp_cd={code}", headers=UA)
@@ -113,13 +116,24 @@ def opinion_rows(code):
             page = response.read().decode("utf-8", "replace")
     except Exception:  # noqa: BLE001
         return None
-    start = page.find('id="cTB24"')
+    start, consensus = page.find('id="cTB24"'), page.find('id="cTB15"')
+    # 페이지엔 [기준:…]이 여럿이다(시세·기업개요…) — 컨센서스 표 바로 앞의 것이 투자의견 컨센서스 기준일.
+    labels = re.findall(r"\[기준:\s*(\d{4})\.(\d{2})\.(\d{2})\]", page[:consensus]) if consensus >= 0 else []
     if start < 0:
+        return None  # 표가 없는 응답 — 호출한 쪽이 조회 실패로 건너뛴다(전과 같음)
+    if not labels:
+        print(f"    FAIL {code} 기업현황 페이지에 투자의견 컨센서스 기준일이 없다 — 형식이 바뀌었는지 볼 것")
+        problems.append(f"기업현황 페이지 형식이 다르다: {code}")
         return None
+    year, month, day = map(int, labels[-1])
+    year, month = (year, month - 3) if month > 3 else (year - 1, month + 9)
+    day = min(day, calendar.monthrange(year, month)[1])
+    boundary = f"{year % 100:02d}/{month:02d}/{day:02d}"  # 표의 일자 형식(YY/MM/DD)이라 문자열로 비교된다
     count = 0
     for row in re.findall(r"<tr[^>]*>(.*?)</tr>", page[start:page.find("</table>", start)], re.S):
         cells = [re.sub(r"<[^>]+>|&nbsp;|\s", "", c) for c in re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)]
-        count += len(cells) >= 7 and bool(cells[5])  # 제공처·일자·목표가·직전목표가·변동률·투자의견·직전투자의견
+        # 제공처·최종일자·목표가·직전목표가·변동률·투자의견·직전투자의견
+        count += len(cells) >= 7 and bool(cells[5]) and cells[1] > boundary
     return count
 
 
@@ -334,7 +348,7 @@ def check_compare_table():
     # 선행PER+1·+2 = 그 행의 현재가 ÷ 선행PER 다음 해·그다음 해 EPS(E) — WiseReport 표(우선주는 보통주 코드)에서
     # 모바일 API 추정 열의 연도로 짝을 찾는다. 전제: 그 연도의 WiseReport EPS = 표의 EPS(E)(같은 컨센서스, 1원 반올림 차).
     # 기관수는 '제공처별 투자의견' 표의 투자의견 있는 행 수와 같아야 한다.
-    later_cells = later_off = aligned = count_cells = count_off = 0
+    later_cells = later_off = aligned = count_cells = count_off = count_warn = 0
     # 도구 쪽 WiseReport 조회가 실패한 칸은 '?'가 맞는 출력이다(러너 IP에선 자주 끊긴다) — 값 대조는 건너뛰고, 그 코드가
     # '?' 각주에 있는지만 본다.
     unknown = [code for r, code in zip(valid, codes) if "?" in (r[col["선행PER+1"]], r[col["선행PER+2"]], r[col["기관수"]])]
@@ -394,15 +408,22 @@ def check_compare_table():
             print(f"    warn {r[0]} 제공처별 투자의견 표 조회 실패 — 기관수 대조 건너뜀")
             continue
         count_cells += 1
-        if r[col["기관수"]] != str(rows_with_opinion):
+        shown = int(r[col["기관수"]]) if r[col["기관수"]].isdigit() else None
+        if shown is None or shown > rows_with_opinion:
             count_off += 1
             print(f"    FAIL 기관수 {r[0]}: 표 {r[col['기관수']]} ≠ 투자의견 낸 증권사 {rows_with_opinion}곳")
             problems.append(f"stock_compare 기관수가 최근 3개월 투자의견 수와 다르다: {r[0]}")
+        elif shown < rows_with_opinion:
+            # FnGuide가 경계일 밖의 이유로 몇 건 더 빼는 종목이 있다(2026-11-16 270종목 중 한화·현대해상 — 원인 모름).
+            # 도구는 FnGuide 값을 그대로 옮기므로 결함이 아니다. 더 많을 때(빼기만 하는 FnGuide와 반대)만 FAIL.
+            count_warn += 1
+            print(f"    warn 기관수 {r[0]}: 표 {shown} < 투자의견 낸 증권사 {rows_with_opinion}곳 — FnGuide가 일부를 더 뺐다")
     if not later_off:
         print(f"    ok   선행PER+1·+2 = 현재가 ÷ 그다음 두 해 EPS(E) — {later_cells}칸 검산 일치, "
               f"첫 추정 연도 짝 {aligned}행 확인")
     if not count_off and count_cells:
-        print(f"    ok   기관수 = 최근 3개월 투자의견을 낸 증권사 수 — {count_cells}행 일치")
+        print(f"    ok   기관수 = 최근 3개월 투자의견을 낸 증권사 수 — {count_cells - count_warn}행 일치"
+              + (f", {count_warn}행은 FnGuide가 더 뺌(위 warn)" if count_warn else ""))
     opm_note_problem(markdown, "stock_compare 검사 표")
 
 
@@ -471,6 +492,33 @@ def check_regular_close():
         else:
             print(f"    FAIL {name} 기준가 {base:,}가 최근 정규장 종가 {closes}와 다르다")
             problems.append(f"분봉 정규장 종가가 기준가와 안 맞는다: {name}")
+
+    # 가짜 분봉 — 종가 단일가가 연장된 날은 종가 봉이 15:32에 찍힌다(2026-11-16 60종목 360건 중 6건, 15:30까지만 받던
+    # 때는 15:19 가격을 종가로 썼다 — 10/12 CI FAIL). 드물어서 살아 있는 종목으론 공회전하니 가짜로 본다. 15:40은 장후
+    # 시간외 종가, 16:01은 애프터마켓이라 종가가 아니다. 연장 중(15:19까지만)이면 아직 모른다.
+    days = {"normal": [("1519", 100), ("1530", 99), ("1540", 98)],
+            "extended": [("1519", 240500), ("1532", 237000), ("1540", 236500), ("1601", 236000)],
+            "running": [("1519", 240500)]}
+
+    def fake(url):
+        query = dict(urllib.parse.parse_qsl(url.split("?", 1)[-1]))
+        lo, hi = query["startDateTime"][8:12], query["endDateTime"][8:12]
+        return [{"localDateTime": f"20200102{t}00", "currentPrice": float(p)}
+                for t, p in days.get(url.split("?")[0].split("/")[-2], []) if lo <= t <= hi]
+
+    saved = server._fetch
+    server._fetch = fake
+    try:
+        got = {case: server._regular_close_on(case, "20200102") for case in days}
+    finally:
+        server._fetch = saved
+        server._SESSION_END.pop("20200102", None)
+    want = {"normal": 99, "extended": 237000, "running": None}
+    if got == want:
+        print("    ok   가짜 분봉 — 평소 15:30·연장 15:32 종가, 연장 중이면 모름, 15:40 시간외·애프터마켓 제외")
+    else:
+        print(f"    FAIL 가짜 분봉 정규장 종가 {got} ≠ {want}")
+        problems.append("정규장 종가가 종가 단일가 연장(15:32)·시간외를 잘못 다룬다")
 
 
 def check_edges():
@@ -852,7 +900,8 @@ def check_consensus():
             if skip_if_external(tag, output):
                 continue
             sections = consensus_tables(output)
-            # 추정기관수 = 제공처별 투자의견 표의 투자의견 수. (E) PER·PBR = 각주의 기준일 정규장 종가 ÷ EPS·BPS —
+            # 추정기관수 = 제공처별 투자의견 표의 투자의견 수(경계일 다음 날부터 — opinion_rows). 적으면 warn, 많으면 FAIL.
+            # (E) PER·PBR = 각주의 기준일 정규장 종가 ÷ EPS·BPS —
             # 이 세 종목은 맞아야 한다(전제: 2026-09-27 109종목 중 108개. 어긋나면 FnGuide 계산이 바뀐 것이니 각주를 볼 것).
             # 도구나 이 검사의 페이지 조회가 외부 장애로 실패하면(러너 IP) 대조만 건너뛴다. 형식 오류 같은 실패는 FAIL.
             count = re.search(r"^추정기관수: (\d+)곳", output, re.M)
@@ -860,11 +909,15 @@ def check_consensus():
             counted = "추정기관수 대조 건너뜀(WiseReport 조회 실패)"
             if not (lookup and external_failure(lookup.group(1))) and rows_with_opinion is not None:
                 counted = f"추정기관수 {rows_with_opinion}곳 일치"
-                if count is None or int(count.group(1)) != rows_with_opinion:
+                if count is None or int(count.group(1)) > rows_with_opinion:
                     print(f"    FAIL {tag} 추정기관수 {count.group(1) if count else lookup and lookup.group(0)} "
                           f"≠ 투자의견 낸 증권사 {rows_with_opinion}곳")
                     problems.append(f"stock_consensus({tag}) 추정기관수가 최근 3개월 투자의견 수와 다르다")
                     counted = "추정기관수는 위 FAIL"  # 아래 ok 줄이 '일치'라고 찍던 것(2026-11-02 CI 로그)
+                elif int(count.group(1)) < rows_with_opinion:
+                    print(f"    warn {tag} 추정기관수 {count.group(1)} < 투자의견 낸 증권사 {rows_with_opinion}곳 "
+                          "— FnGuide가 일부를 더 뺐다(도구는 FnGuide 값 그대로)")
+                    counted = "추정기관수는 위 warn"
             issues, priced = note_problems(output)
             # 기준 주가는 추이 응답의 기준일로 받는다 — 추이가 외부 장애로 다 빠지면 가격을 못 적으니 검산만 건너뛴다.
             if not priced and external_failure(output):

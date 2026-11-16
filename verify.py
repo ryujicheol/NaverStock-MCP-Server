@@ -758,7 +758,8 @@ def note_problems(output):
 
     ① 투자의견 행만 있는 추이 표가 없어야 한다(추정이 없는 기간 — 저스템 2028년이 그렇게 나왔다) ② 영업이익 > 매출액
     행이 있으면 그 각주 ③ 서프라이즈 매출액 실적이 위 표 (A)와 5% 넘게 다르면 그 각주 ④ 각주의 기준 주가 ÷ EPS·BPS가
-    (E) PER·PBR과 맞는지 — 안 맞는 칸이 있을 때만 '맞지 않습니다'. → (문제 목록, 검산한 칸 수)
+    (E) PER·PBR과 맞는지 — 안 맞는 칸이 있을 때만 '맞지 않습니다' ⑤ 머리 기준일 = 가장 최근 추이 기준일, 그보다 이른
+    기간은 각주에 적히고 ④에서 빠진다. → (문제 목록, 검산한 칸 수)
     """
     sections = consensus_tables(output)
     main = (sections.get("실적·추정") or [None])[0]
@@ -782,6 +783,22 @@ def note_problems(output):
                 gaps.append(s[0])
     if bool(gaps) != ("매출액 실적이 위 표 (A)와 5% 넘게 다릅니다" in output):
         issues.append(f"서프라이즈 매출액 각주가 어긋났다(5% 넘게 다른 결산기 {gaps})")
+    # ⑤ 추정 갱신이 멈춘 기간: 머리 기준일은 기간별 기준일 중 가장 최근이고, 그보다 이른 기간은 각주에 적히고
+    # ④ 검산에서 빠진다(그날 주가 기준). 2026-11-16 분기 표 첫 기간(2026.09(E))만 10월 날짜였는데 도구가 그 날짜를 표
+    # 전체에 써서 주간 CI가 실패했다. 추이가 있으면(전체 출력) 각주 목록을 추이의 기간별 기준일과 대조하고, brief는 각주를 따른다.
+    stale_note = re.search(r"추정치 갱신이 멈춘 기간은 PER·PBR도 그 기간의 기준일 주가 기준입니다 — (.*?) \(", output)
+    noted = dict(re.findall(r"(\d{4}\.\d\d\(E\)) (\d{4}-\d\d-\d\d)", stale_note.group(1))) if stale_note else {}
+    trend_dates = dict(re.findall(r"^(\d{4}\.\d\d\(E\)) — 기준일 (\d{4}-\d\d-\d\d)$", output, re.M))
+    if trend_dates:
+        latest = max(trend_dates.values())
+        head = re.search(r"기준일 (\d{4}-\d\d-\d\d)$", output.split("\n")[0])
+        if not head or head.group(1) != latest:
+            issues.append(f"머리 기준일 {head and head.group(1)} ≠ 가장 최근 추이 기준일 {latest}")
+        priced_rows = {r[0] for r in rows if "(E)" in r[0] and (_float(_plain(r[col["PER"]])) is not None
+                                                                 or _float(_plain(r[col["PBR"]])) is not None)}
+        want = {name: day for name, day in trend_dates.items() if day < latest and name in priced_rows}
+        if want != noted:
+            issues.append(f"갱신 멈춘 기간 각주 {noted} ≠ 추이 기준일로 본 {want}")
     m = re.search(r"정규장 종가 ([\d,]+)원 기준", output)
     off, checked = [], 0
     if m:
@@ -789,7 +806,7 @@ def note_problems(output):
         for r in rows:
             for multiple, per_share in (("PER", "EPS"), ("PBR", "BPS")):
                 shown, value = _float(_plain(r[col[multiple]])), _float(r[col[per_share]])
-                if "(E)" not in r[0] or shown is None or not value:
+                if "(E)" not in r[0] or r[0] in noted or shown is None or not value:
                     continue
                 checked += 1
                 if abs(shown - price / value) > 0.005 + price * 0.5 / value ** 2 + 1e-9:
@@ -847,6 +864,7 @@ def check_consensus():
                     print(f"    FAIL {tag} 추정기관수 {count.group(1) if count else lookup and lookup.group(0)} "
                           f"≠ 투자의견 낸 증권사 {rows_with_opinion}곳")
                     problems.append(f"stock_consensus({tag}) 추정기관수가 최근 3개월 투자의견 수와 다르다")
+                    counted = "추정기관수는 위 FAIL"  # 아래 ok 줄이 '일치'라고 찍던 것(2026-11-02 CI 로그)
             issues, priced = note_problems(output)
             # 기준 주가는 추이 응답의 기준일로 받는다 — 추이가 외부 장애로 다 빠지면 가격을 못 적으니 검산만 건너뛴다.
             if not priced and external_failure(output):
@@ -1145,7 +1163,8 @@ def fake_consensus():
     """가짜 응답으로 본다 — 살아 있는 종목은 바뀌어 검사가 공회전할 수 있다(저스템에 2028년 추정이 생기는 등).
 
     투자의견만 있는 추이 기간(저스템 2028년), 영업이익 > 매출액(SK스퀘어), 서프라이즈 매출액이 위 표와 5% 넘게 다름,
-    기준 주가 ÷ EPS와 맞지 않는 PER(SK스퀘어), 추정치는 있는데 추정기관수 0곳(케이씨)을 한 종목에 모았다.
+    기준 주가 ÷ EPS와 맞지 않는 PER(SK스퀘어), 추정치는 있는데 추정기관수 0곳(케이씨), 첫 기간만 추정 갱신이 멈춰
+    기준일이 이른 경우(2026-11-16 삼성전자 분기 2026.09(E) — 그날 주가 기준 PER)를 한 종목에 모았다.
     """
     def cells(**values):
         keys = ("SALES", "YOY", "OP", "NP", "EPS", "BPS", "PER", "PBR", "ROE", "EV")
@@ -1155,14 +1174,14 @@ def fake_consensus():
         cells(YYMM="2024.12(A)", SALES="1,000.0", OP="100.0", NP="80.0", EPS="800", BPS="10,000", PER="10.00"),
         cells(YYMM="2025.12(A)", SALES="1,100.0", YOY="10.00", OP="120.0", NP="90.0", EPS="900", BPS="10,500",
               PER="11.00"),
-        cells(YYMM="2026.12(E)", SALES="1,200.0", YOY="9.09", OP="1,500.0", NP="100.0", EPS="1,000", PER="10.00"),
+        cells(YYMM="2026.12(E)", SALES="1,200.0", YOY="9.09", OP="1,500.0", NP="100.0", EPS="1,000", PER="12.00"),
         cells(YYMM="2027.12(E)", SALES="1,300.0", YOY="8.33", OP="150.0", NP="125.0", EPS="1,250", PER="8.10"),
         cells(YYMM="2028.12(E)")]}
 
-    def trend(sales):
+    def trend(sales, day):
         return {"JsonData": [
-            {"ACC_NM": "투자의견(점수)", "DT": "20260923", **{f"VAL{n}": 4.0 for n in range(1, 6)}},
-            {"ACC_NM": "매출액(억원)", "DT": "20260923", **{f"VAL{n}": sales for n in range(1, 6)}}]}
+            {"ACC_NM": "투자의견(점수)", "DT": day, **{f"VAL{n}": 4.0 for n in range(1, 6)}},
+            {"ACC_NM": "매출액(억원)", "DT": day, **{f"VAL{n}": sales for n in range(1, 6)}}]}
 
     surprise = {"tableData": {"tableHeaderData": [{"CNS_FY_2": "2023", "CNS_FY_1": "2024", "CNS_FY0": "2025"}],
                               "tableData": [{"QTR": "연간실적(A)", "FY0": "2,000.0", "FY0_S": "2026/02/10"},
@@ -1171,11 +1190,14 @@ def fake_consensus():
     def fake(url):
         query = dict(urllib.parse.parse_qsl(url.split("?", 1)[-1]))
         return {"2": table, "1": {"JsonData": [{"YYMM": "202612"}, {"YYMM": "202712"}, {"YYMM": "202812"}]},
-                "4": trend(None if query.get("yymm") == "202812" else 1200.0),
+                # 2026.12(E)만 9/1에 멈췄다 — 그날 주가 12,000원이라 PER 12.00, 나머지는 9/23 종가 10,000원 기준.
+                "4": trend(None if query.get("yymm") == "202812" else 1200.0,
+                           "20260901" if query.get("yymm") == "202612" else "20260923"),
                 "5": surprise if query.get("acc_cd") == "121000" else {"tableData": {"tableData": []}}}[query["flag"]]
 
     saved = server._fetch, server._analyst_count, server._regular_close_on
-    server._fetch, server._analyst_count, server._regular_close_on = fake, lambda code: (0, None), lambda code, d: 10000
+    server._fetch, server._analyst_count = fake, lambda code: (0, None)
+    server._regular_close_on = lambda code, d: {"20260923": 10000, "20260901": 12000}.get(d)
     try:
         full, brief = server.stock_consensus("000000"), server.stock_consensus("000000", brief=True)
     finally:
@@ -1185,7 +1207,12 @@ def fake_consensus():
         "추정 없는 2028년 추이 빠짐": "2028.12(E) —" not in full and "2027.12(E) —" in full,
         "영업이익 > 매출액 각주": "영업이익이 매출액보다 큰 기간이 있습니다(2026.12(E))" in full,
         "서프라이즈 매출액 차이 각주": "5% 넘게 다릅니다(2025 2,000.0 vs 1,100.0" in full,
-        "기준 주가·불일치 각주": "정규장 종가 10,000원 기준입니다. 다만 이 종목은" in full and "(2027.12(E) PER 8.10" in full,
+        "기준 주가·불일치 각주": "기준일(2026-09-23) 정규장 종가 10,000원 기준입니다." in full
+                               and "다만 이 종목은" in full and "(2027.12(E) PER 8.10" in full,
+        "머리 기준일 = 가장 최근 추이 기준일(첫 기간 아님)": all(o.split("\n")[0].endswith("기준일 2026-09-23")
+                                                     for o in (full, brief)),
+        "갱신 멈춘 기간 각주·불일치 판정 제외": all("그 기간의 기준일 주가 기준입니다 — 2026.12(E) 2026-09-01 (" in o
+                                         and "2026.12(E) PER 12.00" not in o for o in (full, brief)),
         "자기 검산 통과": not note_problems(full)[0] and not note_problems(brief)[0],
         "brief: 추이·서프라이즈·차이 각주 없음": "[컨센서스 추이]" not in brief and "[어닝서프라이즈]" not in brief
                                              and "5% 넘게 다릅니다" not in brief and "영업이익이 매출액보다" in brief,

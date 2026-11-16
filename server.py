@@ -645,9 +645,8 @@ def stock_consensus(code: str, period: str = "annual", brief: bool = False) -> s
     listed_ok = isinstance(listed, dict) and "error" not in listed
     periods = [p["YYMM"] for p in (listed.get("JsonData") or []) if isinstance(p, dict)
                and p.get("YYMM") and p["YYMM"] > last_actual] if listed_ok else []
-    # brief는 추이를 싣지 않지만 기준일(추이 응답의 날짜)은 머리와 PER 기준 주가에 쓰므로 첫 기간만 받는다.
-    if brief:
-        periods = periods[:1]
+    # brief는 추이를 싣지 않지만 기간별 기준일(추이 응답의 날짜)은 머리와 PER 기준 주가에 쓰므로 기간 전부 받는다 —
+    # 기준일이 기간마다 다를 수 있어 첫 기간만으로는 모른다(아래 period_dates).
     with ThreadPoolExecutor(max_workers=8) as pool:
         count_job = pool.submit(_analyst_count, code)
         trend_jobs = [pool.submit(_fetch, _consensus_url(code, 4, frq, yymm=p)) for p in periods]
@@ -658,9 +657,15 @@ def stock_consensus(code: str, period: str = "annual", brief: bool = False) -> s
     analysts, analysts_error = count_job.result()
 
     label = "연간" if frq == 0 else "분기"
-    dates = [t["JsonData"][0].get("DT") for t in trends if isinstance(t, dict) and t.get("JsonData")]
+    # 추이 기준일은 기간마다 다를 수 있다 — 추정 갱신이 멈춘 기간은 그날에 남는다. 2026-11-16 삼성전자 분기: 2026.09(E)만
+    # 2026-10-02, 2026.12(E)·2027.03(E)는 2026-11-13(PER × EPS가 2026.09(E)만 276,022, 나머지는 11/13 정규장 종가
+    # 206,000). 첫 기간 날짜를 표 전체에 쓰면 머리가 틀리고, 그날 가격으로 다른 기간을 검산해 '맞지 않습니다'를 잘못
+    # 붙이거나(그날 분봉이 남아 있을 때) 가격을 못 적었다(분봉은 약 6거래일만 남는다). 머리·기준 주가는 가장 최근 날짜로.
+    period_dates = {f"{p[:4]}.{p[4:]}(E)": t["JsonData"][0].get("DT") for p, t in zip(periods, trends)
+                    if isinstance(t, dict) and t.get("JsonData") and t["JsonData"][0].get("DT")}
+    latest = max(period_dates.values(), default=None)
     lines = [
-        f"종목 {code} 컨센서스 ({label}) — FnGuide" + (f", 기준일 {_fmt_yyyymmdd(dates[0])}" if dates else ""),
+        f"종목 {code} 컨센서스 ({label}) — FnGuide" + (f", 기준일 {_fmt_yyyymmdd(latest)}" if latest else ""),
         "출처: 네이버 증권 종목분석 → 컨센서스 (WiseReport). (A) = 실적, (E) = 컨센서스 추정치, '-' = 값 없음",
     ]
     bases = sorted({r.get("MAIN") for r in rows if r.get("MAIN")})
@@ -702,7 +707,7 @@ def stock_consensus(code: str, period: str = "annual", brief: bool = False) -> s
         lines += ["", "현재 컨센서스 추정치가 없습니다."]
 
     trend_lines = []
-    # brief는 추이를 싣지 않는다(첫 기간은 기준일을 알려고만 받았다).
+    # brief는 추이를 싣지 않는다(기간별 기준일을 알려고만 받았다).
     for p, t in zip(periods, [] if brief else trends):
         name = f"{p[:4]}.{p[4:]}(E)"
         items = t.get("JsonData") if isinstance(t, dict) and "error" not in t else None
@@ -825,14 +830,20 @@ def stock_consensus(code: str, period: str = "annual", brief: bool = False) -> s
     # 가격을 적어 두면 현재가로 계산하는 stock_compare와 왜 다른지 보인다. 기준일이 오늘이고 정규장이 안 끝났으면
     # 분봉 마지막 값은 종가가 아니라 적지 않는다. (A)는 결산기 말 종가다 — 2024년 53,200 ÷ 4,950 = 10.75.
     base_price, unmatched = None, ""
-    if dates and has_estimates:
+    if latest and has_estimates:
         now = datetime.now(KST)
-        if dates[0] < f"{now:%Y%m%d}" or f"{now:%H%M}" >= _regular_session_end(dates[0]):
-            base_price = _regular_close_on(code, dates[0])
+        if latest < f"{now:%Y%m%d}" or f"{now:%H%M}" >= _regular_session_end(latest):
+            base_price = _regular_close_on(code, latest)
+    # 기준일이 그보다 이른 기간(추정 갱신이 멈춘 기간)은 PER·PBR도 그날 주가 기준이라 검산에서 빼고 각주로 밝힌다.
+    stale = [(r["YYMM"], period_dates[r["YYMM"]]) for r in estimates
+             if latest and period_dates.get(r.get("YYMM"), latest) < latest and (r.get("PER") or r.get("PBR"))]
+    stale_note = (" 추정치 갱신이 멈춘 기간은 PER·PBR도 그 기간의 기준일 주가 기준입니다 — "
+                  + ", ".join(f"{name} {_fmt_yyyymmdd(day)}" for name, day in stale)
+                  + " (끝난 결산기의 추정이 실적 발표 전후로 멈춘 경우 등)." if stale else "")
     # 나머지 한 종목 SK스퀘어는 (E) PER·PBR이 이 가격 ÷ EPS·BPS보다 1% 높다 — PER × 순이익 ÷ 주가로 역산한 주식 수
     # (1억 3,332만 주)가 순이익 ÷ EPS의 주식 수(1억 3,198만 주)와 다르다(FnGuide 원본). 가격만 적으면 검산이 안 맞으니
     # 그런 칸이 있으면 밝힌다. 허용 오차는 PER·PBR 소수 둘째 자리와 EPS·BPS 원 단위 반올림.
-    for r in estimates if base_price else []:
+    for r in [r for r in estimates if r["YYMM"] not in dict(stale)] if base_price else []:
         for multiple, per_share in (("PER", "EPS"), ("PBR", "BPS")):
             shown, value = _num(r.get(multiple) or "-"), _num(r.get(per_share) or "-")
             if shown is not None and value and not unmatched \
@@ -840,10 +851,10 @@ def stock_consensus(code: str, period: str = "annual", brief: bool = False) -> s
                 unmatched = (f" 다만 이 종목은 (E) PER·PBR이 그 가격 ÷ EPS·BPS와 맞지 않습니다({r['YYMM']} {multiple} "
                              f"{r[multiple]}, {base_price:,} ÷ {r[per_share]} = {base_price / value:.2f}) — FnGuide 원본 "
                              "값을 그대로 두었습니다.")
-    price_basis = (f"기준일({_fmt_yyyymmdd(dates[0])}) 정규장 종가 {base_price:,}원" if base_price
+    price_basis = (f"기준일({_fmt_yyyymmdd(latest)}) 정규장 종가 {base_price:,}원" if base_price
                    else "기준일 정규장 종가")
     if frq == 0:
-        notes.append(f"PER·PBR — (A)는 그 결산기 말 주가, (E)는 {price_basis} 기준입니다.{unmatched} "
+        notes.append(f"PER·PBR — (A)는 그 결산기 말 주가, (E)는 {price_basis} 기준입니다.{stale_note}{unmatched} "
                      "stock_compare의 선행PER(3개년)은 조회 시점 현재가로 계산해, 가격이 이와 다르면 값도 다릅니다.")
     else:
         # 분기 값은 분기 하나로 계산한다 — 2026.09(E) PER 20.97 = 285,500 ÷ 분기 EPS 13,616,
@@ -851,7 +862,7 @@ def stock_consensus(code: str, period: str = "annual", brief: bool = False) -> s
         # stock_financials(모바일 API)의 분기 PER·ROE는 최근 4분기 합산이다 — 삼성전자 2026.06 PER이 여기 31.16,
         # 그쪽 14.98(334,000 ÷ 최근 4분기 EPS 22,358).
         notes.append("분기의 PER·ROE·EV/EBITDA는 그 분기 실적 하나로 계산한 값이라(연환산 아님) 연간 값과 "
-                     f"비교하면 안 됩니다. (E)의 PER·PBR은 {price_basis} 기준입니다.{unmatched} stock_financials의 "
+                     f"비교하면 안 됩니다. (E)의 PER·PBR은 {price_basis} 기준입니다.{stale_note}{unmatched} stock_financials의 "
                      "분기 PER·ROE는 최근 4분기 합산(TTM) 기준이라 이 표와 값이 다릅니다.")
     if cycle:
         # 6개월 결산이면 PER = 결산기 말 종가 ÷ 6개월 EPS다 — 한화리츠 2026.04 5,970 ÷ 97 = 61.55(표 61.59).
